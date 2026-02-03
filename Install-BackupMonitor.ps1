@@ -6,12 +6,13 @@
     This script guides you through setting up the backup monitoring solution:
     - Prompts for Company ID and healthchecks.io ping key
     - Auto-detects Macrium Reflect backup repositories
-    - Validates repository access with provided credentials
+    - Configures repository credentials (stored in Windows Credential Manager)
+    - Configures scheduled task credentials (Windows/AD account)
     - Creates configuration files
     - Sets up a Windows Scheduled Task to run hourly
 
 .NOTES
-    Version: 0.1.0
+    Version: 0.2.0
     Requires: PowerShell 5.1+, Administrator privileges
 #>
 
@@ -45,11 +46,6 @@ function Write-Header {
     Write-Host ""
 }
 
-function Write-Step {
-    param([int]$Number, [string]$Text)
-    Write-Host "[$Number] $Text" -ForegroundColor Yellow
-}
-
 function Get-UserInput {
     param(
         [string]$Prompt,
@@ -63,24 +59,24 @@ function Get-UserInput {
     do {
         if ($IsSecure) {
             $secureInput = Read-Host "$displayPrompt" -AsSecureString
-            $input = [Runtime.InteropServices.Marshal]::PtrToStringAuto(
+            $inputValue = [Runtime.InteropServices.Marshal]::PtrToStringAuto(
                 [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secureInput)
             )
         }
         else {
-            $input = Read-Host "$displayPrompt"
+            $inputValue = Read-Host "$displayPrompt"
         }
 
-        if ([string]::IsNullOrWhiteSpace($input) -and $Default) {
-            $input = $Default
+        if ([string]::IsNullOrWhiteSpace($inputValue) -and $Default) {
+            $inputValue = $Default
         }
 
-        if ($Required -and [string]::IsNullOrWhiteSpace($input)) {
+        if ($Required -and [string]::IsNullOrWhiteSpace($inputValue)) {
             Write-Host "This field is required." -ForegroundColor Red
         }
-    } while ($Required -and [string]::IsNullOrWhiteSpace($input))
+    } while ($Required -and [string]::IsNullOrWhiteSpace($inputValue))
 
-    return $input
+    return $inputValue
 }
 
 function Get-MacriumRepositories {
@@ -115,6 +111,24 @@ function Get-MacriumRepositories {
         Write-Warning "Failed to auto-detect repositories: $_"
         return @()
     }
+}
+
+function Get-ServerNameFromUNC {
+    <#
+    .SYNOPSIS
+        Extracts the server/NAS name from a UNC path.
+    .EXAMPLE
+        Get-ServerNameFromUNC "\\nas002\backup_srv" returns "nas002"
+    #>
+    param(
+        [Parameter(Mandatory)]
+        [string]$UNCPath
+    )
+
+    if ($UNCPath -match "^\\\\([^\\]+)\\") {
+        return $matches[1]
+    }
+    return $null
 }
 
 function Test-RepositoryAccess {
@@ -168,6 +182,27 @@ function Test-HealthChecksConnection {
     }
 }
 
+function Save-CredentialToManager {
+    <#
+    .SYNOPSIS
+        Saves credentials to Windows Credential Manager.
+    #>
+    param(
+        [Parameter(Mandatory)]
+        [string]$Target,
+
+        [Parameter(Mandatory)]
+        [string]$Username,
+
+        [Parameter(Mandatory)]
+        [string]$Password
+    )
+
+    # Use cmdkey to store credentials
+    $result = cmdkey /add:$Target /user:$Username /pass:$Password 2>&1
+    return $LASTEXITCODE -eq 0
+}
+
 #endregion
 
 #region Main
@@ -181,7 +216,7 @@ Write-Host " | |_) | (_| | (__|   <| |_| | |_) || |___| | | |  __/ (__|   < " -F
 Write-Host " |____/ \__,_|\___|_|\_\\__,_| .__/  \____|_| |_|\___|\___|_|\_\" -ForegroundColor Cyan
 Write-Host "                             |_|                               " -ForegroundColor Cyan
 Write-Host ""
-Write-Host "  Backup Monitoring Installer v0.1.0" -ForegroundColor Gray
+Write-Host "  Backup Monitoring Installer v0.2.0" -ForegroundColor Gray
 Write-Host ""
 
 # Check for admin privileges
@@ -266,18 +301,39 @@ if ($repositories.Count -eq 0) {
     exit 1
 }
 
-# Step 4: Credentials for Scheduled Task
-Write-Header "Step 4: Scheduled Task Credentials"
-Write-Host "The scheduled task needs to run as a user with access to the backup repositories." -ForegroundColor Gray
-Write-Host "This is typically a domain account or local account with network share access." -ForegroundColor Gray
+# Step 4: Repository Credentials
+Write-Header "Step 4: Repository Credentials"
+Write-Host "These credentials are used to access the backup repositories (NAS/file shares)." -ForegroundColor Gray
+Write-Host "The credentials will be stored in Windows Credential Manager." -ForegroundColor Gray
 Write-Host ""
 
-$username = Get-UserInput -Prompt "Username (DOMAIN\user or user@domain.com)" -Required
-$password = Get-UserInput -Prompt "Password" -Required -IsSecure
+# Extract server name from first UNC path for domain default
+$serverName = $null
+foreach ($repo in $repositories) {
+    $serverName = Get-ServerNameFromUNC -UNCPath $repo
+    if ($serverName) { break }
+}
 
-# Create credential object
-$securePassword = ConvertTo-SecureString $password -AsPlainText -Force
-$credential = New-Object System.Management.Automation.PSCredential($username, $securePassword)
+if ($serverName) {
+    Write-Host "Detected server name from repository path: $serverName" -ForegroundColor Green
+    Write-Host "This will be used as the domain for repository credentials." -ForegroundColor Gray
+    Write-Host ""
+}
+
+$repoUsername = Get-UserInput -Prompt "Repository username (without domain)" -Required
+$repoPassword = Get-UserInput -Prompt "Repository password" -Required -IsSecure
+
+# Build full username with domain from server name
+if ($serverName) {
+    $repoFullUsername = "$serverName\$repoUsername"
+}
+else {
+    $repoFullUsername = $repoUsername
+}
+
+# Create credential object for testing
+$repoSecurePassword = ConvertTo-SecureString $repoPassword -AsPlainText -Force
+$repoCredential = New-Object System.Management.Automation.PSCredential($repoFullUsername, $repoSecurePassword)
 
 # Step 5: Validate Repository Access
 Write-Header "Step 5: Validating Repository Access"
@@ -286,7 +342,7 @@ $accessFailed = @()
 foreach ($repo in $repositories) {
     Write-Host "  Testing: $repo ... " -NoNewline -ForegroundColor Gray
 
-    if (Test-RepositoryAccess -Path $repo -Credential $credential) {
+    if (Test-RepositoryAccess -Path $repo -Credential $repoCredential) {
         Write-Host "OK" -ForegroundColor Green
     }
     else {
@@ -320,8 +376,41 @@ if ($accessFailed.Count -gt 0) {
     }
 }
 
-# Step 6: Create Configuration Files
-Write-Header "Step 6: Creating Configuration Files"
+# Store repository credentials in Credential Manager
+Write-Host ""
+Write-Host "Storing repository credentials in Windows Credential Manager..." -ForegroundColor Gray
+
+# Get unique server names from all repositories
+$serverNames = @()
+foreach ($repo in $repositories) {
+    $srvName = Get-ServerNameFromUNC -UNCPath $repo
+    if ($srvName -and $srvName -notin $serverNames) {
+        $serverNames += $srvName
+    }
+}
+
+foreach ($srv in $serverNames) {
+    if (Save-CredentialToManager -Target $srv -Username $repoFullUsername -Password $repoPassword) {
+        Write-Host "  Stored credentials for: $srv" -ForegroundColor Green
+    }
+    else {
+        Write-Host "  WARNING: Failed to store credentials for: $srv" -ForegroundColor Yellow
+    }
+}
+
+# Step 6: Scheduled Task Credentials
+Write-Header "Step 6: Scheduled Task Credentials"
+Write-Host "These credentials are used to run the scheduled task on this server." -ForegroundColor Gray
+Write-Host "This should be a Windows/Active Directory account." -ForegroundColor Gray
+Write-Host ""
+Write-Host "See IT-Portal for the 'automat' service account credentials." -ForegroundColor Yellow
+Write-Host ""
+
+$taskUsername = Get-UserInput -Prompt "Task username (DOMAIN\user)" -Default "automat" -Required
+$taskPassword = Get-UserInput -Prompt "Task password (see IT-Portal)" -Required -IsSecure
+
+# Step 7: Create Configuration Files
+Write-Header "Step 7: Creating Configuration Files"
 
 # Create config.json
 $config = @{
@@ -343,8 +432,8 @@ Write-Host "  Created: $ConfigPath" -ForegroundColor Green
 "HC_PING_KEY=$pingKey" | Out-File -FilePath $EnvPath -Encoding UTF8 -Force
 Write-Host "  Created: $EnvPath" -ForegroundColor Green
 
-# Step 7: Create Scheduled Task
-Write-Header "Step 7: Creating Scheduled Task"
+# Step 8: Create Scheduled Task
+Write-Header "Step 8: Creating Scheduled Task"
 
 try {
     # Remove existing task if present
@@ -365,22 +454,22 @@ try {
         -Action $action `
         -Trigger $trigger `
         -Settings $settings `
-        -User $username `
-        -Password $password `
+        -User $taskUsername `
+        -Password $taskPassword `
         -Description "Monitors Macrium Reflect backups and reports to healthchecks.io" `
         -RunLevel Highest
 
     Write-Host "  Scheduled task '$TaskName' created successfully!" -ForegroundColor Green
     Write-Host "  - Runs every hour" -ForegroundColor Gray
-    Write-Host "  - Runs as: $username" -ForegroundColor Gray
+    Write-Host "  - Runs as: $taskUsername" -ForegroundColor Gray
 }
 catch {
     Write-Host "  ERROR: Failed to create scheduled task: $_" -ForegroundColor Red
     Write-Host "  You may need to create the task manually in Task Scheduler." -ForegroundColor Yellow
 }
 
-# Step 8: Test Run
-Write-Header "Step 8: Test Run"
+# Step 9: Test Run
+Write-Header "Step 9: Test Run"
 Write-Host "Running a test to verify everything works..." -ForegroundColor Gray
 Write-Host ""
 
@@ -399,10 +488,11 @@ catch {
 Write-Header "Installation Complete"
 
 Write-Host "Configuration Summary:" -ForegroundColor Cyan
-Write-Host "  Company ID:    $companyId" -ForegroundColor Gray
-Write-Host "  Repositories:  $($repositories.Count)" -ForegroundColor Gray
-Write-Host "  Task User:     $username" -ForegroundColor Gray
-Write-Host "  Task Schedule: Every hour" -ForegroundColor Gray
+Write-Host "  Company ID:        $companyId" -ForegroundColor Gray
+Write-Host "  Repositories:      $($repositories.Count)" -ForegroundColor Gray
+Write-Host "  Repo Credentials:  $repoFullUsername (stored in Credential Manager)" -ForegroundColor Gray
+Write-Host "  Task User:         $taskUsername" -ForegroundColor Gray
+Write-Host "  Task Schedule:     Every hour" -ForegroundColor Gray
 Write-Host ""
 
 Write-Host "Files Created:" -ForegroundColor Cyan
