@@ -1,0 +1,12 @@
+{
+  "companyId": "ACME",
+  "repositories": [
+    "\\\\server\\backup_share"
+  ],
+  "backupMaxAgeHours": 24,
+  "backupFilePattern": "*.mrimg",
+  "skipIfRunning": true,
+  "runningFilePattern": "backup_running*",
+  "healthchecksBaseUrl": "https://hc-ping.com",
+  "autoDetectRepositories": true
+}

@@ -1,0 +1,9 @@
+# Sensitive configuration
+.env
+config.json
+
+# Logs
+*.log
+
+# PowerShell
+*.ps1xml
