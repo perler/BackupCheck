@@ -15,13 +15,21 @@
 [CmdletBinding()]
 param(
     [Parameter()]
-    [string]$ConfigPath = (Join-Path $PSScriptRoot "config.json"),
+    [string]$ConfigPath,
 
     [Parameter()]
-    [string]$EnvPath = (Join-Path $PSScriptRoot ".env")
+    [string]$EnvPath
 )
 
 $ErrorActionPreference = "Stop"
+
+# Determine script directory (handles both direct execution and -File invocation)
+$ScriptDir = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Definition }
+if (-not $ScriptDir) { $ScriptDir = Get-Location }
+
+# Set default paths if not provided
+if (-not $ConfigPath) { $ConfigPath = Join-Path $ScriptDir "config.json" }
+if (-not $EnvPath) { $EnvPath = Join-Path $ScriptDir ".env" }
 
 #region Functions
 
