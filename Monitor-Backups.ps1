@@ -80,12 +80,14 @@ function Get-BackupRepositories {
         if (Test-Path $mrserverPath) {
             try {
                 Write-Verbose "Auto-detecting repositories via mrserver.exe..."
-                $output = & $mrserverPath --action get-repo-status 2>&1
-                $repoData = $output | ConvertFrom-Json
+                $output = & $mrserverPath --action get-repo-status --outputtoconsole 2>&1
+                # mrserver outputs CSV format
+                $repoData = $output | ConvertFrom-Csv
 
                 foreach ($repo in $repoData) {
-                    if ($repo.Path -and (Test-Path $repo.Path -ErrorAction SilentlyContinue)) {
-                        $repositories += $repo.Path
+                    $repoPath = $repo."Repository Path"
+                    if ($repoPath -and (Test-Path $repoPath -ErrorAction SilentlyContinue)) {
+                        $repositories += $repoPath
                     }
                 }
 

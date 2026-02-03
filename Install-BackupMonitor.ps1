@@ -97,13 +97,15 @@ function Get-MacriumRepositories {
 
     try {
         Write-Host "Detecting repositories via Macrium Site Manager..." -ForegroundColor Gray
-        $output = & $mrserverPath --action get-repo-status 2>&1
-        $repoData = $output | ConvertFrom-Json
+        $output = & $mrserverPath --action get-repo-status --outputtoconsole 2>&1
+        # mrserver outputs CSV format
+        $repoData = $output | ConvertFrom-Csv
 
         $repositories = @()
         foreach ($repo in $repoData) {
-            if ($repo.Path) {
-                $repositories += $repo.Path
+            $repoPath = $repo."Repository Path"
+            if ($repoPath) {
+                $repositories += $repoPath
             }
         }
 
