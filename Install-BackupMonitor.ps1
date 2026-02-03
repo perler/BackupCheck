@@ -25,7 +25,10 @@ $ErrorActionPreference = "Stop"
 
 #region Configuration
 
-$ScriptPath = $PSScriptRoot
+# Determine script directory (handles both direct execution and -File invocation)
+$ScriptPath = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Definition }
+if (-not $ScriptPath) { $ScriptPath = Get-Location }
+
 $ConfigPath = Join-Path $ScriptPath "config.json"
 $EnvPath = Join-Path $ScriptPath ".env"
 $MonitorScript = Join-Path $ScriptPath "Monitor-Backups.ps1"
