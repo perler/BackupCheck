@@ -24,6 +24,9 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+# Force TLS 1.2 for all HTTPS connections (required by healthchecks.io)
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+
 #region Configuration
 
 # Determine script directory (handles both direct execution and -File invocation)
@@ -173,12 +176,15 @@ function Test-HealthChecksConnection {
     )
 
     try {
-        # Just test that we can reach the service
+        # Force TLS 1.2 (required by healthchecks.io, older Windows may default to TLS 1.0)
+        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+
+        # Test that we can reach the service
         $response = Invoke-WebRequest -Uri "https://hc-ping.com/$PingKey/test-connection?create=1" -Method POST -UseBasicParsing -TimeoutSec 10
-        return $response.StatusCode -eq 200
+        return @{ Success = $true; Error = $null }
     }
     catch {
-        return $false
+        return @{ Success = $false; Error = $_.Exception.Message }
     }
 }
 
@@ -256,12 +262,21 @@ $pingKey = Get-UserInput -Prompt "Enter healthchecks.io Ping Key" -Required
 
 Write-Host ""
 Write-Host "Testing healthchecks.io connection..." -ForegroundColor Gray
-if (Test-HealthChecksConnection -PingKey $pingKey) {
+$connectionTest = Test-HealthChecksConnection -PingKey $pingKey
+if ($connectionTest.Success) {
     Write-Host "  Connection successful!" -ForegroundColor Green
 }
 else {
     Write-Host "  WARNING: Could not verify connection to healthchecks.io" -ForegroundColor Yellow
-    Write-Host "  The ping key may be invalid or there may be network issues." -ForegroundColor Yellow
+    if ($connectionTest.Error) {
+        Write-Host "  Error: $($connectionTest.Error)" -ForegroundColor Yellow
+    }
+    Write-Host ""
+    Write-Host "  Possible causes:" -ForegroundColor Yellow
+    Write-Host "    - Invalid ping key" -ForegroundColor Gray
+    Write-Host "    - Firewall blocking hc-ping.com" -ForegroundColor Gray
+    Write-Host "    - TLS/SSL issues (requires TLS 1.2)" -ForegroundColor Gray
+    Write-Host ""
     $continue = Get-UserInput -Prompt "Continue anyway? (y/N)"
     if ($continue -ne "y" -and $continue -ne "Y") {
         Write-Host "Installation cancelled." -ForegroundColor Gray
