@@ -275,45 +275,46 @@ else {
 
     $pingKey = Get-UserInput -Prompt "Enter Ping Key" -Required
     $apiKey = Get-UserInput -Prompt "Enter API Key (for management)" -Required
+}
 
-    Write-Host ""
-    Write-Host "Testing healthchecks.io connection..." -ForegroundColor Gray
-    $connectionTest = Test-HealthChecksConnection -PingKey $pingKey
-    if ($connectionTest.Success) {
-        Write-Host "  Connection successful!" -ForegroundColor Green
+# Always test connection
+Write-Host ""
+Write-Host "Testing healthchecks.io connection..." -ForegroundColor Gray
+$connectionTest = Test-HealthChecksConnection -PingKey $pingKey
+if ($connectionTest.Success) {
+    Write-Host "  Connection successful!" -ForegroundColor Green
 
-        # Clean up the test-connection check
-        Write-Host "  Cleaning up test check..." -ForegroundColor Gray
-        try {
-            $headers = @{ "X-Api-Key" = $apiKey }
-            $checks = Invoke-RestMethod -Uri "https://healthchecks.io/api/v3/checks/" -Headers $headers -Method Get
-            $testCheck = $checks.checks | Where-Object { $_.slug -eq "test-connection" }
-            if ($testCheck) {
-                $deleteUrl = "https://healthchecks.io/api/v3/checks/$($testCheck.ping_url.Split('/')[-1])"
-                Invoke-RestMethod -Uri $deleteUrl -Headers $headers -Method Delete | Out-Null
-                Write-Host "  Test check removed." -ForegroundColor Green
-            }
-        }
-        catch {
-            Write-Host "  Could not remove test check: $_" -ForegroundColor Yellow
+    # Clean up the test-connection check
+    Write-Host "  Cleaning up test check..." -ForegroundColor Gray
+    try {
+        $headers = @{ "X-Api-Key" = $apiKey }
+        $checks = Invoke-RestMethod -Uri "https://healthchecks.io/api/v3/checks/" -Headers $headers -Method Get
+        $testCheck = $checks.checks | Where-Object { $_.slug -eq "test-connection" }
+        if ($testCheck) {
+            $deleteUrl = "https://healthchecks.io/api/v3/checks/$($testCheck.ping_url.Split('/')[-1])"
+            Invoke-RestMethod -Uri $deleteUrl -Headers $headers -Method Delete | Out-Null
+            Write-Host "  Test check removed." -ForegroundColor Green
         }
     }
-    else {
-        Write-Host "  WARNING: Could not verify connection to healthchecks.io" -ForegroundColor Yellow
-        if ($connectionTest.Error) {
-            Write-Host "  Error: $($connectionTest.Error)" -ForegroundColor Yellow
-        }
-        Write-Host ""
-        Write-Host "  Possible causes:" -ForegroundColor Yellow
-        Write-Host "    - Invalid ping key" -ForegroundColor Gray
-        Write-Host "    - Firewall blocking hc-ping.com" -ForegroundColor Gray
-        Write-Host "    - TLS/SSL issues (requires TLS 1.2)" -ForegroundColor Gray
-        Write-Host ""
-        $continue = Get-UserInput -Prompt "Continue anyway? (y/N)"
-        if ($continue -ne "y" -and $continue -ne "Y") {
-            Write-Host "Installation cancelled." -ForegroundColor Gray
-            exit 1
-        }
+    catch {
+        Write-Host "  Could not remove test check: $_" -ForegroundColor Yellow
+    }
+}
+else {
+    Write-Host "  WARNING: Could not verify connection to healthchecks.io" -ForegroundColor Yellow
+    if ($connectionTest.Error) {
+        Write-Host "  Error: $($connectionTest.Error)" -ForegroundColor Yellow
+    }
+    Write-Host ""
+    Write-Host "  Possible causes:" -ForegroundColor Yellow
+    Write-Host "    - Invalid ping key" -ForegroundColor Gray
+    Write-Host "    - Firewall blocking hc-ping.com" -ForegroundColor Gray
+    Write-Host "    - TLS/SSL issues (requires TLS 1.2)" -ForegroundColor Gray
+    Write-Host ""
+    $continue = Get-UserInput -Prompt "Continue anyway? (y/N)"
+    if ($continue -ne "y" -and $continue -ne "Y") {
+        Write-Host "Installation cancelled." -ForegroundColor Gray
+        exit 1
     }
 }
 
