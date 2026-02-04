@@ -8,5 +8,6 @@
   "skipIfRunning": true,
   "runningFilePattern": "backup_running*",
   "healthchecksBaseUrl": "https://hc-ping.com",
-  "autoDetectRepositories": true
+  "autoDetectRepositories": true,
+  "tags": []
 }

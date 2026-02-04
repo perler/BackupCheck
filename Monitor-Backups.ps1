@@ -8,7 +8,7 @@
     configured time window and reports the status to healthchecks.io.
 
 .NOTES
-    Version: 0.1.0
+    Version: 0.3.0
     Requires: PowerShell 5.1+
 #>
 
@@ -205,7 +205,10 @@ function Send-HealthCheck {
         [bool]$Success,
 
         [Parameter()]
-        [string]$Message = ""
+        [string]$Message = "",
+
+        [Parameter()]
+        [string[]]$Tags = @()
     )
 
     $endpoint = if ($Success) {
@@ -217,6 +220,12 @@ function Send-HealthCheck {
 
     # Add auto-provisioning parameter
     $endpoint += "?create=1"
+
+    # Add tags if provided
+    if ($Tags.Count -gt 0) {
+        $tagsParam = ($Tags | ForEach-Object { [Uri]::EscapeDataString($_) }) -join " "
+        $endpoint += "&tags=$tagsParam"
+    }
 
     try {
         $params = @{
@@ -245,7 +254,7 @@ function Send-HealthCheck {
 
 #region Main
 
-Write-Host "BackupCheck Monitor v0.1.0" -ForegroundColor Cyan
+Write-Host "BackupCheck Monitor v0.3.0" -ForegroundColor Cyan
 Write-Host "=========================" -ForegroundColor Cyan
 Write-Host ""
 
@@ -267,6 +276,13 @@ if (-not $pingKey) {
 
 Write-Host "Company ID: $($config.companyId)" -ForegroundColor Gray
 Write-Host "Max backup age: $($config.backupMaxAgeHours) hours" -ForegroundColor Gray
+
+# Build tags list: automatic tags + custom tags from config
+$tags = @("backup", "macrium", $config.companyId.ToLower())
+if ($config.tags -and $config.tags.Count -gt 0) {
+    $tags += $config.tags
+}
+Write-Host "Tags: $($tags -join ', ')" -ForegroundColor Gray
 Write-Host ""
 
 # Get repositories
@@ -320,7 +336,8 @@ foreach ($repo in $repositories) {
             -PingKey $pingKey `
             -Slug $slug `
             -Success $health.IsHealthy `
-            -Message $statusMessage
+            -Message $statusMessage `
+            -Tags $tags
 
         if ($health.IsHealthy) {
             Write-Host "  [OK]   $($health.MachineName): $statusMessage" -ForegroundColor Green
