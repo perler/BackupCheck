@@ -254,17 +254,34 @@ $companyId = $companyId.ToUpper()
 
 # Step 2: healthchecks.io Configuration
 Write-Header "Step 2: healthchecks.io Configuration"
-Write-Host "You need a Ping Key from your healthchecks.io project." -ForegroundColor Gray
-Write-Host "Find it at: Project Settings > Ping Key" -ForegroundColor Gray
+Write-Host "You need keys from your healthchecks.io project." -ForegroundColor Gray
+Write-Host "Find them at: Project Settings > API Access" -ForegroundColor Gray
 Write-Host ""
 
-$pingKey = Get-UserInput -Prompt "Enter healthchecks.io Ping Key" -Required
+$pingKey = Get-UserInput -Prompt "Enter Ping Key" -Required
+$apiKey = Get-UserInput -Prompt "Enter API Key (for management)" -Required
 
 Write-Host ""
 Write-Host "Testing healthchecks.io connection..." -ForegroundColor Gray
 $connectionTest = Test-HealthChecksConnection -PingKey $pingKey
 if ($connectionTest.Success) {
     Write-Host "  Connection successful!" -ForegroundColor Green
+
+    # Clean up the test-connection check
+    Write-Host "  Cleaning up test check..." -ForegroundColor Gray
+    try {
+        $headers = @{ "X-Api-Key" = $apiKey }
+        $checks = Invoke-RestMethod -Uri "https://healthchecks.io/api/v3/checks/" -Headers $headers -Method Get
+        $testCheck = $checks.checks | Where-Object { $_.slug -eq "test-connection" }
+        if ($testCheck) {
+            $deleteUrl = "https://healthchecks.io/api/v3/checks/$($testCheck.ping_url.Split('/')[-1])"
+            Invoke-RestMethod -Uri $deleteUrl -Headers $headers -Method Delete | Out-Null
+            Write-Host "  Test check removed." -ForegroundColor Green
+        }
+    }
+    catch {
+        Write-Host "  Could not remove test check: $_" -ForegroundColor Yellow
+    }
 }
 else {
     Write-Host "  WARNING: Could not verify connection to healthchecks.io" -ForegroundColor Yellow
@@ -444,7 +461,10 @@ $configJson | Out-File -FilePath $ConfigPath -Encoding UTF8 -Force
 Write-Host "  Created: $ConfigPath" -ForegroundColor Green
 
 # Create .env
-"HC_PING_KEY=$pingKey" | Out-File -FilePath $EnvPath -Encoding UTF8 -Force
+@"
+HC_PING_KEY=$pingKey
+HC_API_KEY=$apiKey
+"@ | Out-File -FilePath $EnvPath -Encoding UTF8 -Force
 Write-Host "  Created: $EnvPath" -ForegroundColor Green
 
 # Step 8: Create Scheduled Task
