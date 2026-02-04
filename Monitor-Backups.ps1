@@ -23,6 +23,9 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+# Force TLS 1.2 for all HTTPS connections (required by healthchecks.io)
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+
 # Determine script directory (handles both direct execution and -File invocation)
 $ScriptDir = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Definition }
 if (-not $ScriptDir) { $ScriptDir = Get-Location }
