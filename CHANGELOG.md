@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.6] - 2026-02-04
+
+### Added
+- Detection of corrupted backup files (`.mrimg.error_loading`)
+- Check fails when error files are present (triggers cleanup notification)
+
+### Fixed
+- Exclude `.error_loading` and `.tmp` files from backup count
+- Prevent false positives from Macrium temporary/error files
+
 ## [0.3.5] - 2026-02-04
 
 ### Changed

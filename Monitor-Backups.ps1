@@ -160,6 +160,8 @@ function Test-BackupHealth {
         LatestBackup = $null
         BackupAge = $null
         BackupCount = 0
+        HasErrorFiles = $false
+        ErrorFileCount = 0
     }
 
     # Check if backup is currently running
@@ -172,14 +174,24 @@ function Test-BackupHealth {
         }
     }
 
-    # Find backup files
+    # Check for error files (.mrimg.error_loading) - these indicate corruption
+    $errorFiles = Get-ChildItem -Path $Path -Filter "*.error_loading" -Recurse -File -ErrorAction SilentlyContinue
+    if ($errorFiles) {
+        $result.HasErrorFiles = $true
+        $result.ErrorFileCount = ($errorFiles | Measure-Object).Count
+    }
+
+    # Find backup files (exclude .error_loading and other non-backup extensions)
     $cutoffTime = (Get-Date).AddHours(-$MaxAgeHours)
     $backupFiles = Get-ChildItem -Path $Path -Filter $FilePattern -Recurse -File -ErrorAction SilentlyContinue |
-        Where-Object { $_.LastWriteTime -gt $cutoffTime }
+        Where-Object {
+            $_.LastWriteTime -gt $cutoffTime -and
+            $_.Name -notmatch '\.(error_loading|tmp)$'
+        }
 
     $result.BackupCount = ($backupFiles | Measure-Object).Count
 
-    if ($result.BackupCount -gt 0) {
+    if ($result.BackupCount -gt 0 -and -not $result.HasErrorFiles) {
         $latestFile = $backupFiles | Sort-Object LastWriteTime -Descending | Select-Object -First 1
         $result.LatestBackup = $latestFile.FullName
         $result.BackupAge = [math]::Round(((Get-Date) - $latestFile.LastWriteTime).TotalHours, 1)
@@ -327,7 +339,10 @@ foreach ($repo in $repositories) {
         }
 
         # Build status message
-        $statusMessage = if ($health.IsHealthy) {
+        $statusMessage = if ($health.HasErrorFiles) {
+            "ERROR: $($health.ErrorFileCount) corrupted backup file(s) detected (.error_loading) - cleanup required"
+        }
+        elseif ($health.IsHealthy) {
             "Last backup: $($health.BackupAge)h ago ($($health.BackupCount) files within threshold)"
         }
         else {
@@ -342,7 +357,11 @@ foreach ($repo in $repositories) {
             -Message $statusMessage `
             -Tags $tags
 
-        if ($health.IsHealthy) {
+        if ($health.HasErrorFiles) {
+            Write-Host "  [ERR]  $($health.MachineName): $statusMessage" -ForegroundColor Magenta
+            $failCount++
+        }
+        elseif ($health.IsHealthy) {
             Write-Host "  [OK]   $($health.MachineName): $statusMessage" -ForegroundColor Green
             $successCount++
         }
@@ -361,6 +380,7 @@ foreach ($repo in $repositories) {
             IsHealthy = $health.IsHealthy
             IsSkipped = $health.IsSkipped
             BackupAge = $health.BackupAge
+            HasErrorFiles = $health.HasErrorFiles
             PingSuccess = $pingResult.Success
         }
     }
