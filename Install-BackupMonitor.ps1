@@ -233,14 +233,18 @@ if (-not $isAdmin) {
     Write-Host ""
 }
 
-# Check for existing installation
-if ((Test-Path $ConfigPath) -and -not $Force) {
-    Write-Host "Existing configuration found at: $ConfigPath" -ForegroundColor Yellow
-    $overwrite = Get-UserInput -Prompt "Overwrite existing configuration? (y/N)"
-    if ($overwrite -ne "y" -and $overwrite -ne "Y") {
-        Write-Host "Installation cancelled." -ForegroundColor Gray
-        exit 0
-    }
+# Check for existing .env file
+$existingEnv = $null
+if (Test-Path $EnvPath) {
+    Write-Host "Found existing .env file" -ForegroundColor Green
+    $existingEnv = Get-EnvFile -Path $EnvPath
+}
+
+# Check for existing config.json
+$existingConfig = $null
+if (Test-Path $ConfigPath) {
+    Write-Host "Found existing config.json" -ForegroundColor Green
+    $existingConfig = Get-Content $ConfigPath | ConvertFrom-Json
 }
 
 # Step 1: Company ID
@@ -249,55 +253,67 @@ Write-Host "The Company ID is used as a prefix for all health check names." -For
 Write-Host "Example: If Company ID is 'ACME', checks will be named 'acme-wks001', 'acme-srv003', etc." -ForegroundColor Gray
 Write-Host ""
 
-$companyId = Get-UserInput -Prompt "Enter Company ID (e.g., ACME)" -Required
+$defaultCompanyId = if ($existingConfig.companyId) { $existingConfig.companyId } else { "" }
+$companyId = Get-UserInput -Prompt "Enter Company ID (e.g., ACME)" -Default $defaultCompanyId -Required
 $companyId = $companyId.ToUpper()
 
 # Step 2: healthchecks.io Configuration
 Write-Header "Step 2: healthchecks.io Configuration"
-Write-Host "You need keys from your healthchecks.io project." -ForegroundColor Gray
-Write-Host "Find them at: Project Settings > API Access" -ForegroundColor Gray
-Write-Host ""
 
-$pingKey = Get-UserInput -Prompt "Enter Ping Key" -Required
-$apiKey = Get-UserInput -Prompt "Enter API Key (for management)" -Required
+$pingKey = $null
+$apiKey = $null
 
-Write-Host ""
-Write-Host "Testing healthchecks.io connection..." -ForegroundColor Gray
-$connectionTest = Test-HealthChecksConnection -PingKey $pingKey
-if ($connectionTest.Success) {
-    Write-Host "  Connection successful!" -ForegroundColor Green
-
-    # Clean up the test-connection check
-    Write-Host "  Cleaning up test check..." -ForegroundColor Gray
-    try {
-        $headers = @{ "X-Api-Key" = $apiKey }
-        $checks = Invoke-RestMethod -Uri "https://healthchecks.io/api/v3/checks/" -Headers $headers -Method Get
-        $testCheck = $checks.checks | Where-Object { $_.slug -eq "test-connection" }
-        if ($testCheck) {
-            $deleteUrl = "https://healthchecks.io/api/v3/checks/$($testCheck.ping_url.Split('/')[-1])"
-            Invoke-RestMethod -Uri $deleteUrl -Headers $headers -Method Delete | Out-Null
-            Write-Host "  Test check removed." -ForegroundColor Green
-        }
-    }
-    catch {
-        Write-Host "  Could not remove test check: $_" -ForegroundColor Yellow
-    }
+if ($existingEnv -and $existingEnv["HC_PING_KEY"] -and $existingEnv["HC_API_KEY"]) {
+    Write-Host "Using existing healthchecks.io keys from .env" -ForegroundColor Green
+    $pingKey = $existingEnv["HC_PING_KEY"]
+    $apiKey = $existingEnv["HC_API_KEY"]
 }
 else {
-    Write-Host "  WARNING: Could not verify connection to healthchecks.io" -ForegroundColor Yellow
-    if ($connectionTest.Error) {
-        Write-Host "  Error: $($connectionTest.Error)" -ForegroundColor Yellow
+    Write-Host "You need keys from your healthchecks.io project." -ForegroundColor Gray
+    Write-Host "Find them at: Project Settings > API Access" -ForegroundColor Gray
+    Write-Host ""
+
+    $pingKey = Get-UserInput -Prompt "Enter Ping Key" -Required
+    $apiKey = Get-UserInput -Prompt "Enter API Key (for management)" -Required
+
+    Write-Host ""
+    Write-Host "Testing healthchecks.io connection..." -ForegroundColor Gray
+    $connectionTest = Test-HealthChecksConnection -PingKey $pingKey
+    if ($connectionTest.Success) {
+        Write-Host "  Connection successful!" -ForegroundColor Green
+
+        # Clean up the test-connection check
+        Write-Host "  Cleaning up test check..." -ForegroundColor Gray
+        try {
+            $headers = @{ "X-Api-Key" = $apiKey }
+            $checks = Invoke-RestMethod -Uri "https://healthchecks.io/api/v3/checks/" -Headers $headers -Method Get
+            $testCheck = $checks.checks | Where-Object { $_.slug -eq "test-connection" }
+            if ($testCheck) {
+                $deleteUrl = "https://healthchecks.io/api/v3/checks/$($testCheck.ping_url.Split('/')[-1])"
+                Invoke-RestMethod -Uri $deleteUrl -Headers $headers -Method Delete | Out-Null
+                Write-Host "  Test check removed." -ForegroundColor Green
+            }
+        }
+        catch {
+            Write-Host "  Could not remove test check: $_" -ForegroundColor Yellow
+        }
     }
-    Write-Host ""
-    Write-Host "  Possible causes:" -ForegroundColor Yellow
-    Write-Host "    - Invalid ping key" -ForegroundColor Gray
-    Write-Host "    - Firewall blocking hc-ping.com" -ForegroundColor Gray
-    Write-Host "    - TLS/SSL issues (requires TLS 1.2)" -ForegroundColor Gray
-    Write-Host ""
-    $continue = Get-UserInput -Prompt "Continue anyway? (y/N)"
-    if ($continue -ne "y" -and $continue -ne "Y") {
-        Write-Host "Installation cancelled." -ForegroundColor Gray
-        exit 1
+    else {
+        Write-Host "  WARNING: Could not verify connection to healthchecks.io" -ForegroundColor Yellow
+        if ($connectionTest.Error) {
+            Write-Host "  Error: $($connectionTest.Error)" -ForegroundColor Yellow
+        }
+        Write-Host ""
+        Write-Host "  Possible causes:" -ForegroundColor Yellow
+        Write-Host "    - Invalid ping key" -ForegroundColor Gray
+        Write-Host "    - Firewall blocking hc-ping.com" -ForegroundColor Gray
+        Write-Host "    - TLS/SSL issues (requires TLS 1.2)" -ForegroundColor Gray
+        Write-Host ""
+        $continue = Get-UserInput -Prompt "Continue anyway? (y/N)"
+        if ($continue -ne "y" -and $continue -ne "Y") {
+            Write-Host "Installation cancelled." -ForegroundColor Gray
+            exit 1
+        }
     }
 }
 
