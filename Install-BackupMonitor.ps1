@@ -421,7 +421,7 @@ Write-Host ""
 Write-Host "See IT-Portal for the 'automat' service account credentials." -ForegroundColor Yellow
 Write-Host ""
 
-$taskUsername = Get-UserInput -Prompt "Task username (DOMAIN\user)" -Default "automat" -Required
+$taskUsername = Get-UserInput -Prompt "Task username (DOMAIN\user)" -Default "AD\automat" -Required
 $taskPassword = Get-UserInput -Prompt "Task password (see IT-Portal)" -Required -IsSecure
 
 # Step 7: Create Configuration Files
