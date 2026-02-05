@@ -6,13 +6,13 @@
     This script guides you through setting up the backup monitoring solution:
     - Prompts for Company ID and healthchecks.io ping key
     - Auto-detects Macrium Reflect backup repositories
-    - Configures repository credentials (stored in Windows Credential Manager)
+    - Configures repository credentials (stored in .env file)
     - Configures scheduled task credentials (Windows/AD account)
     - Creates configuration files
     - Sets up a Windows Scheduled Task to run hourly
 
 .NOTES
-    Version: 0.3.9
+    Version: 0.4.0
     Requires: PowerShell 5.1+, Administrator privileges
 #>
 
@@ -254,7 +254,7 @@ Write-Host " | |_) | (_| | (__|   <| |_| | |_) || |___| | | |  __/ (__|   < " -F
 Write-Host " |____/ \__,_|\___|_|\_\\__,_| .__/  \____|_| |_|\___|\___|_|\_\" -ForegroundColor Cyan
 Write-Host "                             |_|                               " -ForegroundColor Cyan
 Write-Host ""
-Write-Host "  Backup Monitoring Installer v0.3.9" -ForegroundColor Gray
+Write-Host "  Backup Monitoring Installer v0.4.0" -ForegroundColor Gray
 Write-Host ""
 
 # Check for admin privileges
@@ -385,7 +385,7 @@ if ($repositories.Count -eq 0) {
 # Step 4: Repository Credentials
 Write-Header "Step 4: Repository Credentials"
 Write-Host "These credentials are used to access the backup repositories (NAS/file shares)." -ForegroundColor Gray
-Write-Host "The credentials will be stored in Windows Credential Manager." -ForegroundColor Gray
+Write-Host "The credentials will be stored in the .env file for the scheduled task." -ForegroundColor Gray
 Write-Host ""
 
 # Extract server name from first UNC path for domain default
@@ -461,27 +461,9 @@ if ($accessFailed.Count -gt 0) {
     }
 }
 
-# Store repository credentials in Credential Manager
+# Repository credentials will be stored in .env file (see Step 7)
 Write-Host ""
-Write-Host "Storing repository credentials in Windows Credential Manager..." -ForegroundColor Gray
-
-# Get unique server names from all repositories
-$serverNames = @()
-foreach ($repo in $repositories) {
-    $srvName = Get-ServerNameFromUNC -UNCPath $repo
-    if ($srvName -and $srvName -notin $serverNames) {
-        $serverNames += $srvName
-    }
-}
-
-foreach ($srv in $serverNames) {
-    if (Save-CredentialToManager -Target $srv -Username $repoFullUsername -Password $repoPassword) {
-        Write-Host "  Stored credentials for: $srv" -ForegroundColor Green
-    }
-    else {
-        Write-Host "  WARNING: Failed to store credentials for: $srv" -ForegroundColor Yellow
-    }
-}
+Write-Host "Repository credentials will be stored in .env file for the scheduled task." -ForegroundColor Gray
 
 # Step 6: Scheduled Task Credentials
 Write-Header "Step 6: Scheduled Task Credentials"
@@ -514,10 +496,12 @@ $configJson = $config | ConvertTo-Json -Depth 10
 $configJson | Out-File -FilePath $ConfigPath -Encoding UTF8 -Force
 Write-Host "  Created: $ConfigPath" -ForegroundColor Green
 
-# Create .env
+# Create .env (includes repository credentials for scheduled task access)
 @"
 HC_PING_KEY=$pingKey
 HC_API_KEY=$apiKey
+REPO_USERNAME=$repoFullUsername
+REPO_PASSWORD=$repoPassword
 "@ | Out-File -FilePath $EnvPath -Encoding UTF8 -Force
 Write-Host "  Created: $EnvPath" -ForegroundColor Green
 
@@ -579,7 +563,7 @@ Write-Header "Installation Complete"
 Write-Host "Configuration Summary:" -ForegroundColor Cyan
 Write-Host "  Company ID:        $companyId" -ForegroundColor Gray
 Write-Host "  Repositories:      $($repositories.Count)" -ForegroundColor Gray
-Write-Host "  Repo Credentials:  $repoFullUsername (stored in Credential Manager)" -ForegroundColor Gray
+Write-Host "  Repo Credentials:  $repoFullUsername (stored in .env)" -ForegroundColor Gray
 Write-Host "  Task User:         $taskUsername" -ForegroundColor Gray
 Write-Host "  Task Schedule:     Every hour" -ForegroundColor Gray
 Write-Host ""

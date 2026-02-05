@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] - 2026-02-05
+
+### Fixed
+- **Critical:** Repository credentials now stored in .env file instead of Windows Credential Manager
+  - Previous approach only stored credentials for installer user, not scheduled task user
+  - Monitor script now uses `net use` with stored credentials to connect to shares
+- Automatic cleanup of mounted shares after script completes
+
+### Changed
+- Credential storage moved from Windows Credential Manager to .env file
+- Added `REPO_USERNAME` and `REPO_PASSWORD` fields to .env file
+- Monitor script now explicitly connects to shares before scanning
+
 ## [0.3.9] - 2026-02-04
 
 ### Fixed
@@ -73,7 +86,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 - Installer now prompts for TWO separate credentials:
-  - Repository credentials (for NAS/share access) - stored in Windows Credential Manager
+  - Repository credentials (for NAS/share access) - stored in .env file (changed in v0.4.0)
   - Scheduled task credentials (for running the task) - default username "automat", see IT-Portal
 - Domain name for repository credentials is auto-extracted from share path (e.g., \\nas002\share → nas002)
 - Updated version to 0.2.0

@@ -8,7 +8,7 @@
     configured time window and reports the status to healthchecks.io.
 
 .NOTES
-    Version: 0.3.9
+    Version: 0.4.0
     Requires: PowerShell 5.1+
 #>
 
@@ -25,6 +25,9 @@ $ErrorActionPreference = "Stop"
 
 # Force TLS 1.2 for all HTTPS connections (required by healthchecks.io)
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+
+# Track connections we've made for cleanup
+$script:MountedShares = @()
 
 # Determine script directory (handles both direct execution and -File invocation)
 $ScriptDir = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Definition }
@@ -63,6 +66,76 @@ function Get-EnvFile {
     }
 
     return $env
+}
+
+function Connect-ShareWithCredentials {
+    <#
+    .SYNOPSIS
+        Connects to a UNC share using provided credentials via net use.
+    #>
+    param(
+        [Parameter(Mandatory)]
+        [string]$SharePath,
+
+        [Parameter(Mandatory)]
+        [string]$Username,
+
+        [Parameter(Mandatory)]
+        [string]$Password
+    )
+
+    # Extract server name from UNC path (e.g., \\nas002\backup_srv -> \\nas002)
+    if ($SharePath -match '^(\\\\[^\\]+)') {
+        $serverPath = $Matches[1]
+    }
+    else {
+        Write-Warning "Invalid UNC path: $SharePath"
+        return $false
+    }
+
+    # Check if we can already access the share (credentials may be cached)
+    if (Test-Path $SharePath -ErrorAction SilentlyContinue) {
+        Write-Verbose "Already have access to $SharePath"
+        return $true
+    }
+
+    try {
+        # First, try to disconnect any existing connection to avoid "multiple connections" error
+        $null = net use $serverPath /delete /y 2>&1
+
+        # Connect with credentials
+        $result = net use $serverPath /user:$Username $Password 2>&1
+        if ($LASTEXITCODE -eq 0) {
+            $script:MountedShares += $serverPath
+            Write-Verbose "Connected to $serverPath"
+            return $true
+        }
+        else {
+            Write-Warning "Failed to connect to $serverPath : $result"
+            return $false
+        }
+    }
+    catch {
+        Write-Warning "Error connecting to $serverPath : $_"
+        return $false
+    }
+}
+
+function Disconnect-MountedShares {
+    <#
+    .SYNOPSIS
+        Disconnects all shares mounted by this script.
+    #>
+    foreach ($share in $script:MountedShares) {
+        try {
+            $null = net use $share /delete /y 2>&1
+            Write-Verbose "Disconnected from $share"
+        }
+        catch {
+            Write-Verbose "Failed to disconnect from $share : $_"
+        }
+    }
+    $script:MountedShares = @()
 }
 
 function Get-BackupRepositories {
@@ -284,7 +357,7 @@ function Send-HealthCheck {
 
 #region Main
 
-Write-Host "BackupCheck Monitor v0.3.9" -ForegroundColor Cyan
+Write-Host "BackupCheck Monitor v0.4.0" -ForegroundColor Cyan
 Write-Host "=========================" -ForegroundColor Cyan
 Write-Host ""
 
@@ -325,6 +398,31 @@ $repositories = Get-BackupRepositories -Config $config
 Write-Host "Monitoring $($repositories.Count) repository(ies):" -ForegroundColor Gray
 $repositories | ForEach-Object { Write-Host "  - $_" -ForegroundColor Gray }
 Write-Host ""
+
+# Connect to shares if credentials are provided
+$repoUsername = $envVars["REPO_USERNAME"]
+$repoPassword = $envVars["REPO_PASSWORD"]
+
+if ($repoUsername -and $repoPassword) {
+    Write-Host "Connecting to repositories with stored credentials..." -ForegroundColor Gray
+    $uniqueServers = @{}
+    foreach ($repo in $repositories) {
+        if (-not $uniqueServers.ContainsKey($repo)) {
+            $connected = Connect-ShareWithCredentials -SharePath $repo -Username $repoUsername -Password $repoPassword
+            if ($connected) {
+                Write-Host "  Connected: $repo" -ForegroundColor Green
+            }
+            else {
+                Write-Host "  Failed: $repo" -ForegroundColor Red
+            }
+            # Track by server to avoid duplicate connection attempts
+            if ($repo -match '^(\\\\[^\\]+)') {
+                $uniqueServers[$Matches[1]] = $true
+            }
+        }
+    }
+    Write-Host ""
+}
 
 # Process each repository
 $results = @()
@@ -415,6 +513,12 @@ Write-Host "  Healthy:  $successCount" -ForegroundColor Green
 Write-Host "  Failed:   $failCount" -ForegroundColor $(if ($failCount -gt 0) { "Red" } else { "Gray" })
 Write-Host "  Skipped:  $skipCount" -ForegroundColor Gray
 Write-Host ""
+
+# Cleanup: disconnect any shares we mounted
+if ($script:MountedShares.Count -gt 0) {
+    Write-Verbose "Disconnecting mounted shares..."
+    Disconnect-MountedShares
+}
 
 if ($failCount -gt 0) {
     exit 1
