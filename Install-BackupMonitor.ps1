@@ -12,7 +12,7 @@
     - Sets up a Windows Scheduled Task to run hourly
 
 .NOTES
-    Version: 0.3.8
+    Version: 0.3.9
     Requires: PowerShell 5.1+, Administrator privileges
 #>
 
@@ -254,7 +254,7 @@ Write-Host " | |_) | (_| | (__|   <| |_| | |_) || |___| | | |  __/ (__|   < " -F
 Write-Host " |____/ \__,_|\___|_|\_\\__,_| .__/  \____|_| |_|\___|\___|_|\_\" -ForegroundColor Cyan
 Write-Host "                             |_|                               " -ForegroundColor Cyan
 Write-Host ""
-Write-Host "  Backup Monitoring Installer v0.3.8" -ForegroundColor Gray
+Write-Host "  Backup Monitoring Installer v0.3.9" -ForegroundColor Gray
 Write-Host ""
 
 # Check for admin privileges
@@ -507,6 +507,7 @@ $config = @{
     runningFilePattern = "backup_running*"
     healthchecksBaseUrl = "https://hc-ping.com"
     autoDetectRepositories = $true
+    tags = @()
 }
 
 $configJson = $config | ConvertTo-Json -Depth 10

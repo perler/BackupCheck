@@ -8,7 +8,7 @@
     configured time window and reports the status to healthchecks.io.
 
 .NOTES
-    Version: 0.3.7
+    Version: 0.3.9
     Requires: PowerShell 5.1+
 #>
 
@@ -204,7 +204,7 @@ function Test-BackupHealth {
 function Send-HealthCheck {
     <#
     .SYNOPSIS
-        Sends a ping to healthchecks.io.
+        Sends a ping to healthchecks.io and sets tags via Management API.
     #>
     param(
         [Parameter(Mandatory)]
@@ -223,7 +223,10 @@ function Send-HealthCheck {
         [string]$Message = "",
 
         [Parameter()]
-        [string[]]$Tags = @()
+        [string[]]$Tags = @(),
+
+        [Parameter()]
+        [string]$ApiKey = ""
     )
 
     $endpoint = if ($Success) {
@@ -236,12 +239,6 @@ function Send-HealthCheck {
     # Add auto-provisioning parameter
     $endpoint += "?create=1"
 
-    # Add tags if provided
-    if ($Tags.Count -gt 0) {
-        $tagsParam = ($Tags | ForEach-Object { [Uri]::EscapeDataString($_) }) -join " "
-        $endpoint += "&tags=$tagsParam"
-    }
-
     try {
         $params = @{
             Uri = $endpoint
@@ -252,6 +249,24 @@ function Send-HealthCheck {
         }
 
         $response = Invoke-WebRequest @params
+
+        # Set tags via Management API v1 (ping endpoint doesn't support tags)
+        if ($Tags.Count -gt 0 -and $ApiKey) {
+            try {
+                $headers = @{ "X-Api-Key" = $ApiKey }
+                $checks = Invoke-RestMethod -Uri "https://healthchecks.io/api/v1/checks/" -Headers $headers -Method Get
+                $check = $checks.checks | Where-Object { $_.slug -eq $Slug }
+                if ($check -and $check.update_url) {
+                    $tagsString = $Tags -join " "
+                    $updateBody = @{ tags = $tagsString } | ConvertTo-Json
+                    Invoke-RestMethod -Uri $check.update_url -Headers $headers -Method POST -Body $updateBody -ContentType "application/json" | Out-Null
+                }
+            }
+            catch {
+                # Silently ignore tag update failures
+            }
+        }
+
         return @{
             Success = $true
             StatusCode = $response.StatusCode
@@ -269,7 +284,7 @@ function Send-HealthCheck {
 
 #region Main
 
-Write-Host "BackupCheck Monitor v0.3.7" -ForegroundColor Cyan
+Write-Host "BackupCheck Monitor v0.3.9" -ForegroundColor Cyan
 Write-Host "=========================" -ForegroundColor Cyan
 Write-Host ""
 
@@ -284,9 +299,14 @@ $config = Get-Content $ConfigPath | ConvertFrom-Json
 # Load environment variables
 $envVars = Get-EnvFile -Path $EnvPath
 $pingKey = $envVars["HC_PING_KEY"]
+$apiKey = $envVars["HC_API_KEY"]
 
 if (-not $pingKey) {
     throw "HC_PING_KEY not found in $EnvPath"
+}
+
+if (-not $apiKey) {
+    Write-Warning "HC_API_KEY not found in $EnvPath - tags will not be set"
 }
 
 Write-Host "Company ID: $($config.companyId)" -ForegroundColor Gray
@@ -355,7 +375,8 @@ foreach ($repo in $repositories) {
             -Slug $slug `
             -Success $health.IsHealthy `
             -Message $statusMessage `
-            -Tags $tags
+            -Tags $tags `
+            -ApiKey $apiKey
 
         if ($health.HasErrorFiles) {
             Write-Host "  [ERR]  $($health.MachineName): $statusMessage" -ForegroundColor Magenta
