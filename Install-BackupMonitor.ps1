@@ -12,7 +12,7 @@
     - Sets up a Windows Scheduled Task to run hourly
 
 .NOTES
-    Version: 0.3.0
+    Version: 0.3.7
     Requires: PowerShell 5.1+, Administrator privileges
 #>
 
@@ -47,6 +47,35 @@ function Write-Header {
     Write-Host ""
     Write-Host "=== $Text ===" -ForegroundColor Cyan
     Write-Host ""
+}
+
+function Get-EnvFile {
+    <#
+    .SYNOPSIS
+        Reads a .env file and returns a hashtable of key-value pairs.
+    #>
+    param(
+        [Parameter(Mandatory)]
+        [string]$Path
+    )
+
+    $env = @{}
+
+    if (-not (Test-Path $Path)) {
+        return $env
+    }
+
+    Get-Content $Path | ForEach-Object {
+        $line = $_.Trim()
+        if ($line -and -not $line.StartsWith("#")) {
+            $parts = $line -split "=", 2
+            if ($parts.Count -eq 2) {
+                $env[$parts[0].Trim()] = $parts[1].Trim()
+            }
+        }
+    }
+
+    return $env
 }
 
 function Get-UserInput {
@@ -222,7 +251,7 @@ Write-Host " | |_) | (_| | (__|   <| |_| | |_) || |___| | | |  __/ (__|   < " -F
 Write-Host " |____/ \__,_|\___|_|\_\\__,_| .__/  \____|_| |_|\___|\___|_|\_\" -ForegroundColor Cyan
 Write-Host "                             |_|                               " -ForegroundColor Cyan
 Write-Host ""
-Write-Host "  Backup Monitoring Installer v0.3.0" -ForegroundColor Gray
+Write-Host "  Backup Monitoring Installer v0.3.7" -ForegroundColor Gray
 Write-Host ""
 
 # Check for admin privileges
