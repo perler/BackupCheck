@@ -12,7 +12,7 @@
     - Sets up a Windows Scheduled Task to run hourly
 
 .NOTES
-    Version: 0.3.7
+    Version: 0.3.8
     Requires: PowerShell 5.1+, Administrator privileges
 #>
 
@@ -183,15 +183,18 @@ function Test-RepositoryAccess {
             $driveName = "BackupTest_" + [guid]::NewGuid().ToString("N").Substring(0, 8)
             $null = New-PSDrive -Name $driveName -PSProvider FileSystem -Root $Path -Credential $Credential -ErrorAction Stop
             Remove-PSDrive -Name $driveName -ErrorAction SilentlyContinue
-            return $true
+            return @{ Success = $true; Error = $null }
         }
         catch {
-            return $false
+            return @{ Success = $false; Error = $_.Exception.Message }
         }
     }
     else {
         # Local path - just test existence
-        return Test-Path $Path -ErrorAction SilentlyContinue
+        if (Test-Path $Path -ErrorAction SilentlyContinue) {
+            return @{ Success = $true; Error = $null }
+        }
+        return @{ Success = $false; Error = "Path not found" }
     }
 }
 
@@ -251,7 +254,7 @@ Write-Host " | |_) | (_| | (__|   <| |_| | |_) || |___| | | |  __/ (__|   < " -F
 Write-Host " |____/ \__,_|\___|_|\_\\__,_| .__/  \____|_| |_|\___|\___|_|\_\" -ForegroundColor Cyan
 Write-Host "                             |_|                               " -ForegroundColor Cyan
 Write-Host ""
-Write-Host "  Backup Monitoring Installer v0.3.7" -ForegroundColor Gray
+Write-Host "  Backup Monitoring Installer v0.3.8" -ForegroundColor Gray
 Write-Host ""
 
 # Check for admin privileges
@@ -420,11 +423,15 @@ $accessFailed = @()
 foreach ($repo in $repositories) {
     Write-Host "  Testing: $repo ... " -NoNewline -ForegroundColor Gray
 
-    if (Test-RepositoryAccess -Path $repo -Credential $repoCredential) {
+    $accessTest = Test-RepositoryAccess -Path $repo -Credential $repoCredential
+    if ($accessTest.Success) {
         Write-Host "OK" -ForegroundColor Green
     }
     else {
         Write-Host "FAILED" -ForegroundColor Red
+        if ($accessTest.Error) {
+            Write-Host "    Error: $($accessTest.Error)" -ForegroundColor Yellow
+        }
         $accessFailed += $repo
     }
 }
