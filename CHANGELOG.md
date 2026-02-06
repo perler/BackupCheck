@@ -5,6 +5,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.1] - 2026-02-06
+
+### Fixed
+- **Critical:** Script crash when no existing network connection exists
+  - `net use /delete` throws exception when no connection to delete
+  - Combined with `$ErrorActionPreference = "Stop"`, caused silent script failure
+  - Wrapped disconnect command in nested try-catch to ignore "not found" errors
+- Added outer try-catch block for better error reporting
+
 ## [0.4.0] - 2026-02-05
 
 ### Fixed
