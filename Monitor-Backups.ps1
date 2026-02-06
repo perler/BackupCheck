@@ -8,7 +8,7 @@
     configured time window and reports the status to healthchecks.io.
 
 .NOTES
-    Version: 0.4.0
+    Version: 0.4.1
     Requires: PowerShell 5.1+
 #>
 
@@ -101,7 +101,8 @@ function Connect-ShareWithCredentials {
 
     try {
         # First, try to disconnect any existing connection to avoid "multiple connections" error
-        $null = net use $serverPath /delete /y 2>&1
+        # Use try/catch to ignore "not found" errors when no connection exists
+        try { $null = net use $serverPath /delete /y 2>&1 } catch { }
 
         # Connect with credentials
         $result = net use $serverPath /user:$Username $Password 2>&1
@@ -357,7 +358,7 @@ function Send-HealthCheck {
 
 #region Main
 
-Write-Host "BackupCheck Monitor v0.4.0" -ForegroundColor Cyan
+Write-Host "BackupCheck Monitor v0.4.1" -ForegroundColor Cyan
 Write-Host "=========================" -ForegroundColor Cyan
 Write-Host ""
 
@@ -403,6 +404,7 @@ Write-Host ""
 $repoUsername = $envVars["REPO_USERNAME"]
 $repoPassword = $envVars["REPO_PASSWORD"]
 
+try {
 if ($repoUsername -and $repoPassword) {
     Write-Host "Connecting to repositories with stored credentials..." -ForegroundColor Gray
     $uniqueServers = @{}
@@ -518,6 +520,11 @@ Write-Host ""
 if ($script:MountedShares.Count -gt 0) {
     Write-Verbose "Disconnecting mounted shares..."
     Disconnect-MountedShares
+}
+
+} catch {
+    Write-Error "Script failed: $_"
+    exit 1
 }
 
 if ($failCount -gt 0) {
