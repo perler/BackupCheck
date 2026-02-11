@@ -8,7 +8,7 @@
     configured time window and reports the status to healthchecks.io.
 
 .NOTES
-    Version: 0.4.2
+    Version: 0.5.0
     Requires: PowerShell 5.1+
 #>
 
@@ -275,10 +275,52 @@ function Test-BackupHealth {
     return $result
 }
 
+function Get-DeviceTypeSettings {
+    <#
+    .SYNOPSIS
+        Returns tag, timeout, and grace settings based on device name pattern.
+    #>
+    param(
+        [Parameter(Mandatory)]
+        [string]$MachineName
+    )
+
+    $name = $MachineName.ToUpper()
+
+    if ($name -match "^WKS") {
+        return @{
+            Tag = "wks"
+            Timeout = 345600    # 4 days in seconds
+            Grace = 21600       # 6 hours in seconds
+        }
+    }
+    elseif ($name -match "^NB") {
+        return @{
+            Tag = "nb"
+            Timeout = 691200    # 8 days in seconds
+            Grace = 21600       # 6 hours in seconds
+        }
+    }
+    elseif ($name -match "^SRV") {
+        return @{
+            Tag = "srv"
+            Timeout = 86400     # 1 day in seconds
+            Grace = 64800       # 18 hours in seconds
+        }
+    }
+    else {
+        return @{
+            Tag = $null
+            Timeout = $null
+            Grace = $null
+        }
+    }
+}
+
 function Send-HealthCheck {
     <#
     .SYNOPSIS
-        Sends a ping to healthchecks.io and sets tags via Management API.
+        Sends a ping to healthchecks.io and configures check via Management API.
     #>
     param(
         [Parameter(Mandatory)]
@@ -300,7 +342,10 @@ function Send-HealthCheck {
         [string[]]$Tags = @(),
 
         [Parameter()]
-        [string]$ApiKey = ""
+        [string]$ApiKey = "",
+
+        [Parameter()]
+        [string]$MachineName = ""
     )
 
     $endpoint = if ($Success) {
@@ -324,20 +369,40 @@ function Send-HealthCheck {
 
         $response = Invoke-WebRequest @params
 
-        # Set tags via Management API v1 (ping endpoint doesn't support tags)
-        if ($Tags.Count -gt 0 -and $ApiKey) {
+        # Configure check via Management API v1
+        if ($ApiKey) {
             try {
                 $headers = @{ "X-Api-Key" = $ApiKey }
                 $checks = Invoke-RestMethod -Uri "https://healthchecks.io/api/v1/checks/" -Headers $headers -Method Get
                 $check = $checks.checks | Where-Object { $_.slug -eq $Slug }
                 if ($check -and $check.update_url) {
-                    $tagsString = $Tags -join " "
-                    $updateBody = @{ tags = $tagsString } | ConvertTo-Json
+                    # Get device-specific settings
+                    $deviceSettings = Get-DeviceTypeSettings -MachineName $MachineName
+
+                    # Build tags list including device type tag
+                    $allTags = $Tags.Clone()
+                    if ($deviceSettings.Tag -and $deviceSettings.Tag -notin $allTags) {
+                        $allTags += $deviceSettings.Tag
+                    }
+                    $tagsString = $allTags -join " "
+
+                    # Build update body
+                    $updateData = @{ tags = $tagsString }
+
+                    # Add timeout and grace if device type is recognized
+                    if ($deviceSettings.Timeout) {
+                        $updateData.timeout = $deviceSettings.Timeout
+                    }
+                    if ($deviceSettings.Grace) {
+                        $updateData.grace = $deviceSettings.Grace
+                    }
+
+                    $updateBody = $updateData | ConvertTo-Json
                     Invoke-RestMethod -Uri $check.update_url -Headers $headers -Method POST -Body $updateBody -ContentType "application/json" | Out-Null
                 }
             }
             catch {
-                # Silently ignore tag update failures
+                # Silently ignore configuration update failures
             }
         }
 
@@ -358,7 +423,7 @@ function Send-HealthCheck {
 
 #region Main
 
-Write-Host "BackupCheck Monitor v0.4.2" -ForegroundColor Cyan
+Write-Host "BackupCheck Monitor v0.5.0" -ForegroundColor Cyan
 Write-Host "=========================" -ForegroundColor Cyan
 Write-Host ""
 
@@ -469,14 +534,15 @@ foreach ($repo in $repositories) {
             "No backups found within last $($config.backupMaxAgeHours) hours"
         }
 
-        # Send health check
+        # Send health check and configure check settings based on device type
         $pingResult = Send-HealthCheck -BaseUrl $config.healthchecksBaseUrl `
             -PingKey $pingKey `
             -Slug $slug `
             -Success $health.IsHealthy `
             -Message $statusMessage `
             -Tags $tags `
-            -ApiKey $apiKey
+            -ApiKey $apiKey `
+            -MachineName $health.MachineName
 
         if ($health.HasErrorFiles) {
             Write-Host "  [ERR]  $($health.MachineName): $statusMessage" -ForegroundColor Magenta
