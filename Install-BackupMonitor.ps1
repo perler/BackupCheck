@@ -12,7 +12,7 @@
     - Sets up a Windows Scheduled Task to run hourly
 
 .NOTES
-    Version: 0.4.0
+    Version: 0.4.2
     Requires: PowerShell 5.1+, Administrator privileges
 #>
 
@@ -254,7 +254,7 @@ Write-Host " | |_) | (_| | (__|   <| |_| | |_) || |___| | | |  __/ (__|   < " -F
 Write-Host " |____/ \__,_|\___|_|\_\\__,_| .__/  \____|_| |_|\___|\___|_|\_\" -ForegroundColor Cyan
 Write-Host "                             |_|                               " -ForegroundColor Cyan
 Write-Host ""
-Write-Host "  Backup Monitoring Installer v0.4.0" -ForegroundColor Gray
+Write-Host "  Backup Monitoring Installer v0.4.2" -ForegroundColor Gray
 Write-Host ""
 
 # Check for admin privileges
@@ -530,15 +530,33 @@ try {
         -User $taskUsername `
         -Password $taskPassword `
         -Description "Monitors Macrium Reflect backups and reports to healthchecks.io" `
-        -RunLevel Highest
+        -RunLevel Highest `
+        -ErrorAction Stop
 
-    Write-Host "  Scheduled task '$TaskName' created successfully!" -ForegroundColor Green
-    Write-Host "  - Runs every hour" -ForegroundColor Gray
-    Write-Host "  - Runs as: $taskUsername" -ForegroundColor Gray
+    # Verify the task was actually created
+    $verifyTask = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+    if ($verifyTask) {
+        Write-Host "  Scheduled task '$TaskName' created successfully!" -ForegroundColor Green
+        Write-Host "  - Runs every hour" -ForegroundColor Gray
+        Write-Host "  - Runs as: $taskUsername" -ForegroundColor Gray
+    }
+    else {
+        throw "Task registration returned success but task not found"
+    }
 }
 catch {
-    Write-Host "  ERROR: Failed to create scheduled task: $_" -ForegroundColor Red
-    Write-Host "  You may need to create the task manually in Task Scheduler." -ForegroundColor Yellow
+    Write-Host ""
+    Write-Host "  ERROR: Failed to create scheduled task!" -ForegroundColor Red
+    Write-Host "  Reason: $_" -ForegroundColor Red
+    Write-Host ""
+    Write-Host "  Common causes:" -ForegroundColor Yellow
+    Write-Host "    - Invalid username format (use DOMAIN\username)" -ForegroundColor Gray
+    Write-Host "    - User account does not exist" -ForegroundColor Gray
+    Write-Host "    - Incorrect password" -ForegroundColor Gray
+    Write-Host "    - Insufficient privileges" -ForegroundColor Gray
+    Write-Host ""
+    Write-Host "  You will need to create the task manually in Task Scheduler." -ForegroundColor Yellow
+    Write-Host "  Or re-run this installer with correct credentials." -ForegroundColor Yellow
 }
 
 # Step 9: Test Run

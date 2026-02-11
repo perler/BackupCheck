@@ -8,7 +8,7 @@
     configured time window and reports the status to healthchecks.io.
 
 .NOTES
-    Version: 0.4.1
+    Version: 0.4.2
     Requires: PowerShell 5.1+
 #>
 
@@ -358,7 +358,7 @@ function Send-HealthCheck {
 
 #region Main
 
-Write-Host "BackupCheck Monitor v0.4.1" -ForegroundColor Cyan
+Write-Host "BackupCheck Monitor v0.4.2" -ForegroundColor Cyan
 Write-Host "=========================" -ForegroundColor Cyan
 Write-Host ""
 
