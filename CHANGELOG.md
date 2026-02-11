@@ -5,6 +5,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] - 2026-02-11
+
+### Added
+- **Auto-configure checks based on device naming convention**
+  - WKS* devices: tag `wks`, period 4 days, grace 6 hours
+  - NB* devices: tag `nb`, period 8 days, grace 6 hours
+  - SRV* devices: tag `srv`, period 1 day, grace 18 hours
+  - Settings applied automatically via Management API on each ping
+
 ## [0.4.2] - 2026-02-11
 
 ### Fixed
