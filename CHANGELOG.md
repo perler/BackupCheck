@@ -5,6 +5,37 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.0] - 2026-02-18
+
+### Changed
+- **Switched from HC pause to channel muting** (`pause-offline-checks.py`)
+  - HC's "pause" gets undone by any ping - the backup monitor's hourly failure
+    pings were un-pausing checks and triggering alerts every hour
+  - Now removes notification channels (`channels: ""`) from offline machines' checks
+  - Failure pings still come in but no alert emails are sent
+  - Channels restored (`channels: "*"`) when Atera shows agent back online
+  - Muted state tracked in persistent JSON file (`/cron/data/.muted-checks.json`)
+  - This is a temporary workaround - long-term fix is integrating Atera checks
+    into Monitor-Backups.ps1 directly (requires auto-update mechanism)
+
+### Changed
+- Cron schedule changed from every 6 hours to **every hour at :45**
+- Deployed to orbit-cron container (moved from ai.patsplanet.com cron)
+- orbit-cron container migrated from `alpine:latest` to `python:3.12-slim`
+  with entrypoint.sh / packages.txt pattern for easy package management
+
+## [0.6.0] - 2026-02-17
+
+### Added
+- **Auto-pause healthchecks for offline machines** (`pause-offline-checks.py`)
+  - Detects offline workstations/notebooks via Atera RMM agent status
+  - Two-path decision tree: preventive muting vs already-down handling
+  - Dynamic threshold: derived from each check's own period minus 1 day
+  - Dual-signal safety for preventive path: Atera offline AND no recent backup ping
+  - Already-down path: requires agent offline >24h (protects against Atera blips)
+  - Servers excluded: only `wks` and `nb` device types are eligible
+  - `--dry-run` and `--verbose` flags for safe testing
+
 ## [0.5.0] - 2026-02-11
 
 ### Added
