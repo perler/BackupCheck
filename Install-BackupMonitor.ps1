@@ -12,7 +12,7 @@
     - Sets up a Windows Scheduled Task to run hourly
 
 .NOTES
-    Version: 2.0.0
+    Version: 2.1.0
     Requires: PowerShell 5.1+, Administrator privileges
 #>
 
@@ -254,7 +254,7 @@ Write-Host " | |_) | (_| | (__|   <| |_| | |_) || |___| | | |  __/ (__|   < " -F
 Write-Host " |____/ \__,_|\___|_|\_\\__,_| .__/  \____|_| |_|\___|\___|_|\_\" -ForegroundColor Cyan
 Write-Host "                             |_|                               " -ForegroundColor Cyan
 Write-Host ""
-Write-Host "  Backup Monitoring Installer v2.0.0" -ForegroundColor Gray
+Write-Host "  Backup Monitoring Installer v2.1.0" -ForegroundColor Gray
 Write-Host ""
 
 # Check for admin privileges

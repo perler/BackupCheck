@@ -5,6 +5,26 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.1.0] - 2026-02-19
+
+### Added
+- **Coordinator API** (`coordinator/`)
+  - Flask app receiving backup scan results via `POST /api/report`
+  - Correlates with Atera RMM agent status (cached, refreshed every 15 min)
+  - Decision matrix: OK→success, Missing+Online→fail, Missing+Offline→skip ping
+  - SQLite storage for reports and Atera agent cache
+  - API key authentication, health check endpoint, status dashboard
+  - Docker deployment with docker-compose
+  - Replaces `pause-offline-checks.py` channel muting workaround
+- **Coordinator integration in Monitor-Backups.ps1**
+  - Scans repos first, then POSTs all results to coordinator in one request
+  - Falls back to direct HC pings if coordinator is unreachable
+  - Configured via `coordinatorUrl`/`coordinatorApiKey` in config or env
+
+### Changed
+- Monitor script refactored to two-phase: scan first, then report
+- Version bumped to 2.1.0
+
 ## [2.0.0] - 2026-02-18
 
 ### Added

@@ -8,9 +8,10 @@
     configured time window and reports the status to healthchecks.io.
 
     v2.0 adds: self-updating, HC API caching, structured logging, meta-monitoring.
+    v2.1 adds: coordinator API integration with direct-ping fallback.
 
 .NOTES
-    Version: 2.0.0
+    Version: 2.1.0
     Requires: PowerShell 5.1+
 #>
 
@@ -32,7 +33,7 @@ $ErrorActionPreference = "Stop"
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
 # Script version
-$script:Version = "2.0.0"
+$script:Version = "2.1.0"
 
 # Track connections we've made for cleanup
 $script:MountedShares = @()
@@ -693,6 +694,72 @@ function Invoke-SelfUpdate {
     }
 }
 
+function Send-CoordinatorReport {
+    <#
+    .SYNOPSIS
+        Sends backup scan results to the coordinator API.
+    .OUTPUTS
+        Returns $true if the coordinator accepted the report, $false otherwise.
+    #>
+    param(
+        [Parameter(Mandatory)]
+        [string]$CoordinatorUrl,
+
+        [Parameter(Mandatory)]
+        [string]$ApiKey,
+
+        [Parameter(Mandatory)]
+        [string]$CompanyId,
+
+        [Parameter(Mandatory)]
+        [array]$MachineResults
+    )
+
+    $body = @{
+        companyId = $CompanyId
+        version = $script:Version
+        machines = @($MachineResults | ForEach-Object {
+            @{
+                name = $_.MachineName
+                healthy = $_.IsHealthy
+                backupAge = $_.BackupAge
+                backupCount = $_.BackupCount
+                message = $_.StatusMessage
+            }
+        })
+    } | ConvertTo-Json -Depth 5
+
+    try {
+        $headers = @{
+            "X-API-Key" = $ApiKey
+            "Content-Type" = "application/json"
+        }
+        $response = Invoke-WebRequest -Uri $CoordinatorUrl `
+            -Method POST `
+            -Body $body `
+            -Headers $headers `
+            -UseBasicParsing `
+            -TimeoutSec 30
+
+        if ($response.StatusCode -eq 200) {
+            $result = $response.Content | ConvertFrom-Json
+            Write-Log "Coordinator accepted report: $($result.results.Count) machines processed" -Level OK -Color Green
+            foreach ($r in $result.results) {
+                Write-Log "  [$($r.slug)] verdict: $($r.verdict)"
+            }
+            return $true
+        }
+        else {
+            Write-Log "Coordinator returned status $($response.StatusCode)" -Level WARN -Color Yellow
+            return $false
+        }
+    }
+    catch {
+        Write-Log "Coordinator unreachable: $_ - falling back to direct HC pings" -Level WARN -Color Yellow
+        return $false
+    }
+}
+
 #endregion
 
 #region Main
@@ -789,7 +856,7 @@ if ($repoUsername -and $repoPassword) {
     }
 }
 
-# Process each repository
+# Phase 1: Scan all repositories and collect results
 $results = @()
 $successCount = 0
 $failCount = 0
@@ -821,7 +888,7 @@ foreach ($repo in $repositories) {
             continue
         }
 
-        # Build status message with version prefix
+        # Build status message
         $statusDetail = if ($health.HasErrorFiles) {
             "ERROR: $($health.ErrorFileCount) corrupted backup file(s) detected (.error_loading)"
         }
@@ -831,18 +898,6 @@ foreach ($repo in $repositories) {
         else {
             "No backups found within last $($config.backupMaxAgeHours) hours"
         }
-        $statusMessage = "[BackupCheck v$($script:Version)] $statusDetail"
-
-        # Send health check with cached configuration
-        $pingResult = Send-HealthCheck -BaseUrl $config.healthchecksBaseUrl `
-            -PingKey $pingKey `
-            -Slug $slug `
-            -Success $health.IsHealthy `
-            -Message $statusMessage `
-            -Tags $tags `
-            -ApiKey $apiKey `
-            -MachineName $health.MachineName `
-            -ConfigCache $configCache
 
         if ($health.HasErrorFiles) {
             Write-Log "  [ERR]  $($health.MachineName): $statusDetail" -Level FAIL -Color Magenta
@@ -857,24 +912,60 @@ foreach ($repo in $repositories) {
             $failCount++
         }
 
-        if (-not $pingResult.Success) {
-            Write-Log "    Failed to send ping: $($pingResult.Error)" -Level WARN -Color Yellow
-        }
-
         $results += @{
             MachineName = $health.MachineName
             Slug = $slug
             IsHealthy = $health.IsHealthy
             IsSkipped = $health.IsSkipped
             BackupAge = $health.BackupAge
+            BackupCount = $health.BackupCount
             HasErrorFiles = $health.HasErrorFiles
-            PingSuccess = $pingResult.Success
+            StatusMessage = "[BackupCheck v$($script:Version)] $statusDetail"
         }
     }
 }
 
-# Save HC API configuration cache
-Save-ConfigCache -Cache $configCache
+# Phase 2: Report results - coordinator or direct HC pings
+$coordinatorUrl = if ($config.coordinatorUrl) { $config.coordinatorUrl } else { $envVars["COORDINATOR_URL"] }
+$coordinatorKey = if ($config.coordinatorApiKey) { $config.coordinatorApiKey } else { $envVars["COORDINATOR_API_KEY"] }
+$useDirectPing = $true
+
+if ($coordinatorUrl -and $coordinatorKey -and $results.Count -gt 0) {
+    Write-Log "Sending results to coordinator ($coordinatorUrl)..."
+    $coordSuccess = Send-CoordinatorReport `
+        -CoordinatorUrl $coordinatorUrl `
+        -ApiKey $coordinatorKey `
+        -CompanyId $config.companyId `
+        -MachineResults $results
+    if ($coordSuccess) {
+        $useDirectPing = $false
+    }
+}
+
+if ($useDirectPing) {
+    if ($coordinatorUrl) {
+        Write-Log "Falling back to direct HC pings" -Level WARN -Color Yellow
+    }
+
+    foreach ($r in $results) {
+        $pingResult = Send-HealthCheck -BaseUrl $config.healthchecksBaseUrl `
+            -PingKey $pingKey `
+            -Slug $r.Slug `
+            -Success $r.IsHealthy `
+            -Message $r.StatusMessage `
+            -Tags $tags `
+            -ApiKey $apiKey `
+            -MachineName $r.MachineName `
+            -ConfigCache $configCache
+
+        if (-not $pingResult.Success) {
+            Write-Log "  Failed to send ping for $($r.MachineName): $($pingResult.Error)" -Level WARN -Color Yellow
+        }
+    }
+
+    # Save HC API configuration cache (only used in direct ping mode)
+    Save-ConfigCache -Cache $configCache
+}
 
 # Summary
 Write-Log ""

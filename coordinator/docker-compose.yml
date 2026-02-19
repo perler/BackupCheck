@@ -1,0 +1,24 @@
+services:
+  coordinator:
+    build: .
+    container_name: backupcheck-coordinator
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:5050:5000"
+    environment:
+      - HC_API_KEY=${HC_API_KEY}
+      - HC_PING_KEY=${HC_PING_KEY}
+      - ATERA_API_KEY=${ATERA_API_KEY}
+      - COORDINATOR_API_KEYS=${COORDINATOR_API_KEYS}
+      - COORDINATOR_DB=/data/coordinator.db
+      - ATERA_CACHE_SECONDS=900
+    volumes:
+      - coordinator-data:/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:5000/api/health')"]
+      interval: 60s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  coordinator-data:
