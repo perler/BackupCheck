@@ -5,6 +5,9 @@ services:
     restart: unless-stopped
     ports:
       - "127.0.0.1:5050:5000"
+    labels:
+      proxy.aliases: backupcheck
+      proxy.port: "5000"
     environment:
       - HC_API_KEY=${HC_API_KEY}
       - HC_PING_KEY=${HC_PING_KEY}
