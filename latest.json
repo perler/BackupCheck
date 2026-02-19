@@ -2,10 +2,10 @@
   "version": "2.0.0",
   "files": {
     "Monitor-Backups.ps1": {
-      "sha256": "PLACEHOLDER_UPDATED_BY_CI"
+      "sha256": "3778c8cc4cda514c6987f1c4eed8d5ff3e39d011875ceaf169a5e2cbf3099692"
     },
     "Install-BackupMonitor.ps1": {
-      "sha256": "PLACEHOLDER_UPDATED_BY_CI"
+      "sha256": "2ab2395667c3445ddfc94c745e113b93595f6bbbeca2eb5b9a3974f10ec11073"
     }
   },
   "releaseUrl": "https://github.com/perler/BackupCheck/releases/download/v2.0.0/BackupCheck-v2.0.0.zip"
