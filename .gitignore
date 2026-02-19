@@ -2,6 +2,13 @@
 .env
 config.json
 
+# Runtime state
+.configured-checks.json
+.last-update-check
+
+# Backups from auto-update
+*.bak
+
 # Logs
 *.log
 

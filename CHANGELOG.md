@@ -5,6 +5,43 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.0.0] - 2026-02-18
+
+### Added
+- **Self-updating mechanism** (`Monitor-Backups.ps1`)
+  - Checks GitHub for new releases every 24 hours via `latest.json`
+  - Downloads release zip, verifies SHA256 checksums for each file
+  - Backs up current files to `.bak`, extracts new versions, re-launches
+  - Graceful fallback: update failures log a warning and continue with current version
+  - `-SkipUpdateCheck` flag to bypass update check (used during re-launch)
+- **HC API caching** to reduce Management API calls
+  - Configuration cache in `.configured-checks.json`
+  - Only calls HC Management API when: slug not cached, settings differ, or cache >7 days old
+  - Reduces ~480 redundant API calls/day to near zero for stable configurations
+- **Structured logging** with `Write-Log` function
+  - Console + `backupcheck.log` with timestamps and severity levels
+  - Automatic 7-day log rotation on each run
+- **Meta-monitoring**: pings `{companyId}-monitor-health` check after each run
+  - Detects when the monitor itself stops running
+- **Version in ping body**: `[BackupCheck v2.0.0] Last backup: 4.2h ago (3 files)`
+- **Config version field**: `configVersion: 2` in config.json for future migration
+- **`latest.json`** version pointer for auto-update mechanism
+- **GitHub Actions release workflow** (`.github/workflows/release.yml`)
+  - Builds release zip on tag push
+  - Computes SHA256 checksums
+  - Updates `latest.json` in master branch
+  - Creates GitHub Release with zip artifact
+- **Public repo preparation**
+  - MIT License
+  - Public-facing README.md
+  - Sanitized all client-specific references from examples
+
+### Changed
+- Version bumped from 0.5.0 to 2.0.0 (major architecture upgrade)
+- `Send-HealthCheck` now accepts and uses `ConfigCache` parameter
+- Installer now writes `configVersion: 2` to config.json
+- `.env.example` updated with coordinator fields (for v2.1)
+
 ## [0.7.0] - 2026-02-18
 
 ### Changed

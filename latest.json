@@ -1,0 +1,12 @@
+{
+  "version": "2.0.0",
+  "files": {
+    "Monitor-Backups.ps1": {
+      "sha256": "PLACEHOLDER_UPDATED_BY_CI"
+    },
+    "Install-BackupMonitor.ps1": {
+      "sha256": "PLACEHOLDER_UPDATED_BY_CI"
+    }
+  },
+  "releaseUrl": "https://github.com/perler/BackupCheck/releases/download/v2.0.0/BackupCheck-v2.0.0.zip"
+}

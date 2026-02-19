@@ -7,8 +7,10 @@
     For each machine directory found, it checks if a backup was completed within the
     configured time window and reports the status to healthchecks.io.
 
+    v2.0 adds: self-updating, HC API caching, structured logging, meta-monitoring.
+
 .NOTES
-    Version: 0.5.0
+    Version: 2.0.0
     Requires: PowerShell 5.1+
 #>
 
@@ -18,13 +20,19 @@ param(
     [string]$ConfigPath,
 
     [Parameter()]
-    [string]$EnvPath
+    [string]$EnvPath,
+
+    [Parameter()]
+    [switch]$SkipUpdateCheck
 )
 
 $ErrorActionPreference = "Stop"
 
 # Force TLS 1.2 for all HTTPS connections (required by healthchecks.io)
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+
+# Script version
+$script:Version = "2.0.0"
 
 # Track connections we've made for cleanup
 $script:MountedShares = @()
@@ -37,7 +45,72 @@ if (-not $ScriptDir) { $ScriptDir = Get-Location }
 if (-not $ConfigPath) { $ConfigPath = Join-Path $ScriptDir "config.json" }
 if (-not $EnvPath) { $EnvPath = Join-Path $ScriptDir ".env" }
 
+# Cache and state file paths
+$script:ConfigCachePath = Join-Path $ScriptDir ".configured-checks.json"
+$script:UpdateCheckPath = Join-Path $ScriptDir ".last-update-check"
+$script:LogPath = Join-Path $ScriptDir "backupcheck.log"
+
 #region Functions
+
+function Write-Log {
+    <#
+    .SYNOPSIS
+        Writes a log entry to console and log file with timestamp.
+    #>
+    param(
+        [Parameter(Mandatory)]
+        [string]$Message,
+
+        [Parameter()]
+        [ValidateSet("INFO", "WARN", "ERROR", "OK", "FAIL", "SKIP")]
+        [string]$Level = "INFO",
+
+        [Parameter()]
+        [ConsoleColor]$Color = [ConsoleColor]::Gray
+    )
+
+    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    $logLine = "[$timestamp] [$Level] $Message"
+
+    # Console output with color
+    Write-Host $logLine -ForegroundColor $Color
+
+    # File output (append)
+    try {
+        $logLine | Out-File -FilePath $script:LogPath -Append -Encoding UTF8
+    }
+    catch {
+        # Don't let logging failures kill the script
+    }
+}
+
+function Invoke-LogRotation {
+    <#
+    .SYNOPSIS
+        Removes log entries older than 7 days.
+    #>
+    if (-not (Test-Path $script:LogPath)) { return }
+
+    try {
+        $cutoff = (Get-Date).AddDays(-7).ToString("yyyy-MM-dd")
+        $lines = Get-Content $script:LogPath -ErrorAction SilentlyContinue
+        if (-not $lines) { return }
+
+        $kept = $lines | Where-Object {
+            if ($_ -match '^\[(\d{4}-\d{2}-\d{2})') {
+                $Matches[1] -ge $cutoff
+            }
+            else {
+                $true  # Keep lines without dates (shouldn't happen, but safe)
+            }
+        }
+
+        $kept | Out-File -FilePath $script:LogPath -Encoding UTF8 -Force
+    }
+    catch {
+        # Silently ignore rotation failures
+    }
+}
 
 function Get-EnvFile {
     <#
@@ -89,35 +162,34 @@ function Connect-ShareWithCredentials {
         $serverPath = $Matches[1]
     }
     else {
-        Write-Warning "Invalid UNC path: $SharePath"
+        Write-Log "Invalid UNC path: $SharePath" -Level WARN -Color Yellow
         return $false
     }
 
     # Check if we can already access the share (credentials may be cached)
     if (Test-Path $SharePath -ErrorAction SilentlyContinue) {
-        Write-Verbose "Already have access to $SharePath"
+        Write-Log "Already have access to $SharePath" -Level INFO
         return $true
     }
 
     try {
         # First, try to disconnect any existing connection to avoid "multiple connections" error
-        # Use try/catch to ignore "not found" errors when no connection exists
         try { $null = net use $serverPath /delete /y 2>&1 } catch { }
 
         # Connect with credentials
         $result = net use $serverPath /user:$Username $Password 2>&1
         if ($LASTEXITCODE -eq 0) {
             $script:MountedShares += $serverPath
-            Write-Verbose "Connected to $serverPath"
+            Write-Log "Connected to $serverPath" -Level INFO
             return $true
         }
         else {
-            Write-Warning "Failed to connect to $serverPath : $result"
+            Write-Log "Failed to connect to $serverPath : $result" -Level WARN -Color Yellow
             return $false
         }
     }
     catch {
-        Write-Warning "Error connecting to $serverPath : $_"
+        Write-Log "Error connecting to $serverPath : $_" -Level WARN -Color Yellow
         return $false
     }
 }
@@ -130,10 +202,9 @@ function Disconnect-MountedShares {
     foreach ($share in $script:MountedShares) {
         try {
             $null = net use $share /delete /y 2>&1
-            Write-Verbose "Disconnected from $share"
         }
         catch {
-            Write-Verbose "Failed to disconnect from $share : $_"
+            # Silently ignore disconnect failures
         }
     }
     $script:MountedShares = @()
@@ -156,9 +227,8 @@ function Get-BackupRepositories {
         $mrserverPath = "C:\Program Files\Macrium\SiteManager\mrserver.exe"
         if (Test-Path $mrserverPath) {
             try {
-                Write-Verbose "Auto-detecting repositories via mrserver.exe..."
+                Write-Log "Auto-detecting repositories via mrserver.exe..."
                 $output = & $mrserverPath --action get-repo-status --outputtoconsole 2>&1
-                # mrserver outputs CSV format
                 $repoData = $output | ConvertFrom-Csv
 
                 foreach ($repo in $repoData) {
@@ -169,12 +239,12 @@ function Get-BackupRepositories {
                 }
 
                 if ($repositories.Count -gt 0) {
-                    Write-Verbose "Auto-detected $($repositories.Count) repositories"
+                    Write-Log "Auto-detected $($repositories.Count) repositories"
                     return $repositories
                 }
             }
             catch {
-                Write-Warning "Auto-detection failed: $_"
+                Write-Log "Auto-detection failed: $_" -Level WARN -Color Yellow
             }
         }
     }
@@ -317,10 +387,51 @@ function Get-DeviceTypeSettings {
     }
 }
 
+function Get-ConfigCache {
+    <#
+    .SYNOPSIS
+        Loads the HC API configuration cache from disk.
+    #>
+    if (-not (Test-Path $script:ConfigCachePath)) {
+        return @{}
+    }
+
+    try {
+        $raw = Get-Content $script:ConfigCachePath -Raw | ConvertFrom-Json
+        # Convert PSCustomObject to hashtable
+        $cache = @{}
+        $raw.PSObject.Properties | ForEach-Object {
+            $cache[$_.Name] = $_.Value
+        }
+        return $cache
+    }
+    catch {
+        return @{}
+    }
+}
+
+function Save-ConfigCache {
+    <#
+    .SYNOPSIS
+        Saves the HC API configuration cache to disk.
+    #>
+    param(
+        [Parameter(Mandatory)]
+        [hashtable]$Cache
+    )
+
+    try {
+        $Cache | ConvertTo-Json -Depth 10 | Out-File -FilePath $script:ConfigCachePath -Encoding UTF8 -Force
+    }
+    catch {
+        Write-Log "Failed to save config cache: $_" -Level WARN -Color Yellow
+    }
+}
+
 function Send-HealthCheck {
     <#
     .SYNOPSIS
-        Sends a ping to healthchecks.io and configures check via Management API.
+        Sends a ping to healthchecks.io and configures check via Management API (with caching).
     #>
     param(
         [Parameter(Mandatory)]
@@ -345,7 +456,10 @@ function Send-HealthCheck {
         [string]$ApiKey = "",
 
         [Parameter()]
-        [string]$MachineName = ""
+        [string]$MachineName = "",
+
+        [Parameter()]
+        [hashtable]$ConfigCache = @{}
     )
 
     $endpoint = if ($Success) {
@@ -369,40 +483,66 @@ function Send-HealthCheck {
 
         $response = Invoke-WebRequest @params
 
-        # Configure check via Management API v1
-        if ($ApiKey) {
-            try {
-                $headers = @{ "X-Api-Key" = $ApiKey }
-                $checks = Invoke-RestMethod -Uri "https://healthchecks.io/api/v1/checks/" -Headers $headers -Method Get
-                $check = $checks.checks | Where-Object { $_.slug -eq $Slug }
-                if ($check -and $check.update_url) {
-                    # Get device-specific settings
-                    $deviceSettings = Get-DeviceTypeSettings -MachineName $MachineName
+        # Configure check via Management API v1 (with caching to reduce API calls)
+        if ($ApiKey -and $MachineName) {
+            $deviceSettings = Get-DeviceTypeSettings -MachineName $MachineName
 
-                    # Build tags list including device type tag
-                    $allTags = $Tags.Clone()
-                    if ($deviceSettings.Tag -and $deviceSettings.Tag -notin $allTags) {
-                        $allTags += $deviceSettings.Tag
-                    }
-                    $tagsString = $allTags -join " "
+            # Build desired tags
+            $allTags = $Tags.Clone()
+            if ($deviceSettings.Tag -and $deviceSettings.Tag -notin $allTags) {
+                $allTags += $deviceSettings.Tag
+            }
+            $tagsString = $allTags -join " "
 
-                    # Build update body
-                    $updateData = @{ tags = $tagsString }
+            # Build desired config for comparison
+            $desiredConfig = @{
+                tags = $tagsString
+                timeout = $deviceSettings.Timeout
+                grace = $deviceSettings.Grace
+            }
 
-                    # Add timeout and grace if device type is recognized
-                    if ($deviceSettings.Timeout) {
-                        $updateData.timeout = $deviceSettings.Timeout
-                    }
-                    if ($deviceSettings.Grace) {
-                        $updateData.grace = $deviceSettings.Grace
-                    }
+            # Check cache to see if configuration is already applied
+            $cached = $ConfigCache[$Slug]
+            $needsUpdate = $true
 
-                    $updateBody = $updateData | ConvertTo-Json
-                    Invoke-RestMethod -Uri $check.update_url -Headers $headers -Method POST -Body $updateBody -ContentType "application/json" | Out-Null
+            if ($cached) {
+                $cacheAge = if ($cached.configuredAt) {
+                    ((Get-Date) - [datetime]::Parse($cached.configuredAt)).TotalDays
+                } else { 999 }
+
+                if ($cacheAge -lt 7 -and
+                    $cached.tags -eq $desiredConfig.tags -and
+                    $cached.timeout -eq $desiredConfig.timeout -and
+                    $cached.grace -eq $desiredConfig.grace) {
+                    $needsUpdate = $false
                 }
             }
-            catch {
-                # Silently ignore configuration update failures
+
+            if ($needsUpdate) {
+                try {
+                    $headers = @{ "X-Api-Key" = $ApiKey }
+                    $checks = Invoke-RestMethod -Uri "https://healthchecks.io/api/v1/checks/" -Headers $headers -Method Get
+                    $check = $checks.checks | Where-Object { $_.slug -eq $Slug }
+                    if ($check -and $check.update_url) {
+                        $updateData = @{ tags = $tagsString }
+                        if ($deviceSettings.Timeout) { $updateData.timeout = $deviceSettings.Timeout }
+                        if ($deviceSettings.Grace) { $updateData.grace = $deviceSettings.Grace }
+
+                        $updateBody = $updateData | ConvertTo-Json
+                        Invoke-RestMethod -Uri $check.update_url -Headers $headers -Method POST -Body $updateBody -ContentType "application/json" | Out-Null
+
+                        # Update cache
+                        $ConfigCache[$Slug] = @{
+                            tags = $tagsString
+                            timeout = $deviceSettings.Timeout
+                            grace = $deviceSettings.Grace
+                            configuredAt = (Get-Date).ToString("yyyy-MM-dd")
+                        }
+                    }
+                }
+                catch {
+                    # Silently ignore configuration update failures
+                }
             }
         }
 
@@ -419,16 +559,152 @@ function Send-HealthCheck {
     }
 }
 
+function Test-UpdateAvailable {
+    <#
+    .SYNOPSIS
+        Checks GitHub for a newer version of BackupCheck.
+    .OUTPUTS
+        Returns update info hashtable if update available, $null otherwise.
+    #>
+    param(
+        [Parameter(Mandatory)]
+        [string]$RepoUrl
+    )
+
+    # Check if we should skip (checked within last 24h)
+    if (Test-Path $script:UpdateCheckPath) {
+        $lastCheck = (Get-Item $script:UpdateCheckPath).LastWriteTime
+        if (((Get-Date) - $lastCheck).TotalHours -lt 24) {
+            Write-Log "Update check skipped (last checked $('{0:N1}' -f ((Get-Date) - $lastCheck).TotalHours)h ago)"
+            return $null
+        }
+    }
+
+    # Touch the timestamp file
+    try {
+        [IO.File]::WriteAllText($script:UpdateCheckPath, (Get-Date).ToString("o"))
+    }
+    catch { }
+
+    try {
+        Write-Log "Checking for updates..."
+        $latestJson = Invoke-RestMethod -Uri "$RepoUrl/latest.json" -TimeoutSec 10 -UseBasicParsing
+        $remoteVersion = [version]$latestJson.version
+        $localVersion = [version]$script:Version
+
+        if ($remoteVersion -gt $localVersion) {
+            Write-Log "Update available: v$($script:Version) -> v$($latestJson.version)" -Level INFO -Color Cyan
+            return $latestJson
+        }
+        else {
+            Write-Log "Up to date (v$($script:Version))"
+            return $null
+        }
+    }
+    catch {
+        Write-Log "Update check failed: $_" -Level WARN -Color Yellow
+        return $null
+    }
+}
+
+function Invoke-SelfUpdate {
+    <#
+    .SYNOPSIS
+        Downloads and applies an update from the release URL.
+    #>
+    param(
+        [Parameter(Mandatory)]
+        $UpdateInfo
+    )
+
+    $releaseUrl = $UpdateInfo.releaseUrl
+    if (-not $releaseUrl) {
+        Write-Log "No release URL in update info" -Level WARN -Color Yellow
+        return $false
+    }
+
+    $zipPath = Join-Path $env:TEMP "BackupCheck-update.zip"
+    $extractPath = Join-Path $env:TEMP "BackupCheck-update"
+
+    try {
+        # Download the release zip
+        Write-Log "Downloading update from $releaseUrl..."
+        Invoke-WebRequest -Uri $releaseUrl -OutFile $zipPath -UseBasicParsing -TimeoutSec 60
+
+        # Verify SHA256 of individual files after extraction
+        if (Test-Path $extractPath) {
+            Remove-Item $extractPath -Recurse -Force
+        }
+        Expand-Archive -Path $zipPath -DestinationPath $extractPath -Force
+
+        # Verify checksums for each file listed in the update info
+        $verified = $true
+        foreach ($fileEntry in $UpdateInfo.files.PSObject.Properties) {
+            $fileName = $fileEntry.Name
+            $expectedHash = $fileEntry.Value.sha256
+            $extractedFile = Get-ChildItem -Path $extractPath -Filter $fileName -Recurse | Select-Object -First 1
+
+            if (-not $extractedFile) {
+                Write-Log "Update file not found in archive: $fileName" -Level WARN -Color Yellow
+                $verified = $false
+                break
+            }
+
+            $actualHash = (Get-FileHash -Path $extractedFile.FullName -Algorithm SHA256).Hash.ToLower()
+            if ($actualHash -ne $expectedHash.ToLower()) {
+                Write-Log "SHA256 mismatch for $fileName! Expected: $expectedHash, Got: $actualHash" -Level ERROR -Color Red
+                $verified = $false
+                break
+            }
+        }
+
+        if (-not $verified) {
+            Write-Log "Update verification failed, aborting update" -Level ERROR -Color Red
+            return $false
+        }
+
+        # Backup current files and copy new ones
+        foreach ($fileEntry in $UpdateInfo.files.PSObject.Properties) {
+            $fileName = $fileEntry.Name
+            $currentFile = Join-Path $ScriptDir $fileName
+            $extractedFile = Get-ChildItem -Path $extractPath -Filter $fileName -Recurse | Select-Object -First 1
+
+            if (Test-Path $currentFile) {
+                $bakFile = "$currentFile.bak"
+                Copy-Item -Path $currentFile -Destination $bakFile -Force
+                Write-Log "Backed up $fileName -> $fileName.bak"
+            }
+
+            Copy-Item -Path $extractedFile.FullName -Destination $currentFile -Force
+            Write-Log "Updated $fileName" -Level OK -Color Green
+        }
+
+        Write-Log "Update to v$($UpdateInfo.version) complete! Restarting..." -Level OK -Color Green
+        return $true
+    }
+    catch {
+        Write-Log "Update failed: $_" -Level ERROR -Color Red
+        return $false
+    }
+    finally {
+        # Cleanup temp files
+        Remove-Item $zipPath -Force -ErrorAction SilentlyContinue
+        Remove-Item $extractPath -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
 #endregion
 
 #region Main
 
-Write-Host "BackupCheck Monitor v0.5.0" -ForegroundColor Cyan
-Write-Host "=========================" -ForegroundColor Cyan
-Write-Host ""
+# Rotate logs before starting
+Invoke-LogRotation
+
+Write-Log "BackupCheck Monitor v$($script:Version)" -Color Cyan
+Write-Log ("=" * 40) -Color Cyan
 
 # Load configuration
-Write-Host "Loading configuration..." -ForegroundColor Gray
+Write-Log "Loading configuration..."
 if (-not (Test-Path $ConfigPath)) {
     throw "Configuration file not found: $ConfigPath. Run Install-BackupMonitor.ps1 first."
 }
@@ -445,25 +721,49 @@ if (-not $pingKey) {
 }
 
 if (-not $apiKey) {
-    Write-Warning "HC_API_KEY not found in $EnvPath - tags will not be set"
+    Write-Log "HC_API_KEY not found in $EnvPath - tags and caching will not work" -Level WARN -Color Yellow
 }
 
-Write-Host "Company ID: $($config.companyId)" -ForegroundColor Gray
-Write-Host "Max backup age: $($config.backupMaxAgeHours) hours" -ForegroundColor Gray
+# Self-update check
+if (-not $SkipUpdateCheck) {
+    $updateRepoUrl = if ($config.updateUrl) {
+        $config.updateUrl
+    }
+    else {
+        "https://raw.githubusercontent.com/perler/BackupCheck/master"
+    }
+
+    $updateInfo = Test-UpdateAvailable -RepoUrl $updateRepoUrl
+    if ($updateInfo) {
+        $updated = Invoke-SelfUpdate -UpdateInfo $updateInfo
+        if ($updated) {
+            # Re-launch the updated script
+            $relaunchArgs = @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "`"$($MyInvocation.MyCommand.Definition)`"", "-SkipUpdateCheck")
+            if ($ConfigPath) { $relaunchArgs += "-ConfigPath", "`"$ConfigPath`"" }
+            if ($EnvPath) { $relaunchArgs += "-EnvPath", "`"$EnvPath`"" }
+            Start-Process -FilePath "powershell.exe" -ArgumentList $relaunchArgs -NoNewWindow -Wait
+            exit 0
+        }
+    }
+}
+
+Write-Log "Company ID: $($config.companyId)"
+Write-Log "Max backup age: $($config.backupMaxAgeHours) hours"
 
 # Build tags list: automatic tags + custom tags from config
 $tags = @("backup", "macrium", $config.companyId.ToLower())
 if ($config.tags -and $config.tags.Count -gt 0) {
     $tags += $config.tags
 }
-Write-Host "Tags: $($tags -join ', ')" -ForegroundColor Gray
-Write-Host ""
+Write-Log "Tags: $($tags -join ', ')"
 
 # Get repositories
 $repositories = Get-BackupRepositories -Config $config
-Write-Host "Monitoring $($repositories.Count) repository(ies):" -ForegroundColor Gray
-$repositories | ForEach-Object { Write-Host "  - $_" -ForegroundColor Gray }
-Write-Host ""
+Write-Log "Monitoring $($repositories.Count) repository(ies):"
+$repositories | ForEach-Object { Write-Log "  - $_" }
+
+# Load HC API configuration cache
+$configCache = Get-ConfigCache
 
 # Connect to shares if credentials are provided
 $repoUsername = $envVars["REPO_USERNAME"]
@@ -471,24 +771,22 @@ $repoPassword = $envVars["REPO_PASSWORD"]
 
 try {
 if ($repoUsername -and $repoPassword) {
-    Write-Host "Connecting to repositories with stored credentials..." -ForegroundColor Gray
+    Write-Log "Connecting to repositories with stored credentials..."
     $uniqueServers = @{}
     foreach ($repo in $repositories) {
         if (-not $uniqueServers.ContainsKey($repo)) {
             $connected = Connect-ShareWithCredentials -SharePath $repo -Username $repoUsername -Password $repoPassword
             if ($connected) {
-                Write-Host "  Connected: $repo" -ForegroundColor Green
+                Write-Log "  Connected: $repo" -Level OK -Color Green
             }
             else {
-                Write-Host "  Failed: $repo" -ForegroundColor Red
+                Write-Log "  Failed: $repo" -Level FAIL -Color Red
             }
-            # Track by server to avoid duplicate connection attempts
             if ($repo -match '^(\\\\[^\\]+)') {
                 $uniqueServers[$Matches[1]] = $true
             }
         }
     }
-    Write-Host ""
 }
 
 # Process each repository
@@ -498,10 +796,10 @@ $failCount = 0
 $skipCount = 0
 
 foreach ($repo in $repositories) {
-    Write-Host "Scanning: $repo" -ForegroundColor Yellow
+    Write-Log "Scanning: $repo" -Color Yellow
 
     if (-not (Test-Path $repo)) {
-        Write-Warning "Repository not accessible: $repo"
+        Write-Log "Repository not accessible: $repo" -Level WARN -Color Yellow
         continue
     }
 
@@ -518,14 +816,14 @@ foreach ($repo in $repositories) {
         $slug = Get-CheckSlug -CompanyId $config.companyId -MachineName $health.MachineName
 
         if ($health.IsSkipped) {
-            Write-Host "  [SKIP] $($health.MachineName): $($health.SkipReason)" -ForegroundColor DarkGray
+            Write-Log "  [SKIP] $($health.MachineName): $($health.SkipReason)" -Level SKIP -Color DarkGray
             $skipCount++
             continue
         }
 
-        # Build status message
-        $statusMessage = if ($health.HasErrorFiles) {
-            "ERROR: $($health.ErrorFileCount) corrupted backup file(s) detected (.error_loading) - cleanup required"
+        # Build status message with version prefix
+        $statusDetail = if ($health.HasErrorFiles) {
+            "ERROR: $($health.ErrorFileCount) corrupted backup file(s) detected (.error_loading)"
         }
         elseif ($health.IsHealthy) {
             "Last backup: $($health.BackupAge)h ago ($($health.BackupCount) files within threshold)"
@@ -533,8 +831,9 @@ foreach ($repo in $repositories) {
         else {
             "No backups found within last $($config.backupMaxAgeHours) hours"
         }
+        $statusMessage = "[BackupCheck v$($script:Version)] $statusDetail"
 
-        # Send health check and configure check settings based on device type
+        # Send health check with cached configuration
         $pingResult = Send-HealthCheck -BaseUrl $config.healthchecksBaseUrl `
             -PingKey $pingKey `
             -Slug $slug `
@@ -542,23 +841,24 @@ foreach ($repo in $repositories) {
             -Message $statusMessage `
             -Tags $tags `
             -ApiKey $apiKey `
-            -MachineName $health.MachineName
+            -MachineName $health.MachineName `
+            -ConfigCache $configCache
 
         if ($health.HasErrorFiles) {
-            Write-Host "  [ERR]  $($health.MachineName): $statusMessage" -ForegroundColor Magenta
+            Write-Log "  [ERR]  $($health.MachineName): $statusDetail" -Level FAIL -Color Magenta
             $failCount++
         }
         elseif ($health.IsHealthy) {
-            Write-Host "  [OK]   $($health.MachineName): $statusMessage" -ForegroundColor Green
+            Write-Log "  [OK]   $($health.MachineName): $statusDetail" -Level OK -Color Green
             $successCount++
         }
         else {
-            Write-Host "  [FAIL] $($health.MachineName): $statusMessage" -ForegroundColor Red
+            Write-Log "  [FAIL] $($health.MachineName): $statusDetail" -Level FAIL -Color Red
             $failCount++
         }
 
         if (-not $pingResult.Success) {
-            Write-Warning "    Failed to send ping: $($pingResult.Error)"
+            Write-Log "    Failed to send ping: $($pingResult.Error)" -Level WARN -Color Yellow
         }
 
         $results += @{
@@ -573,23 +873,36 @@ foreach ($repo in $repositories) {
     }
 }
 
+# Save HC API configuration cache
+Save-ConfigCache -Cache $configCache
+
 # Summary
-Write-Host ""
-Write-Host "Summary" -ForegroundColor Cyan
-Write-Host "-------" -ForegroundColor Cyan
-Write-Host "  Healthy:  $successCount" -ForegroundColor Green
-Write-Host "  Failed:   $failCount" -ForegroundColor $(if ($failCount -gt 0) { "Red" } else { "Gray" })
-Write-Host "  Skipped:  $skipCount" -ForegroundColor Gray
-Write-Host ""
+Write-Log ""
+Write-Log "Summary" -Color Cyan
+Write-Log "-------" -Color Cyan
+Write-Log "  Healthy:  $successCount" -Level OK -Color Green
+Write-Log "  Failed:   $failCount" -Level $(if ($failCount -gt 0) { "FAIL" } else { "INFO" }) -Color $(if ($failCount -gt 0) { "Red" } else { "Gray" })
+Write-Log "  Skipped:  $skipCount" -Level INFO
+
+# Meta-monitoring: ping a health check for the monitor itself
+$metaSlug = "$($config.companyId)-monitor-health".ToLower()
+$metaMessage = "[BackupCheck v$($script:Version)] Completed: $successCount ok, $failCount fail, $skipCount skip"
+try {
+    $metaEndpoint = "$($config.healthchecksBaseUrl)/$pingKey/$metaSlug`?create=1"
+    Invoke-WebRequest -Uri $metaEndpoint -Method POST -Body $metaMessage -ContentType "text/plain" -UseBasicParsing | Out-Null
+    Write-Log "Meta-monitoring ping sent ($metaSlug)" -Level OK -Color Green
+}
+catch {
+    Write-Log "Meta-monitoring ping failed: $_" -Level WARN -Color Yellow
+}
 
 # Cleanup: disconnect any shares we mounted
 if ($script:MountedShares.Count -gt 0) {
-    Write-Verbose "Disconnecting mounted shares..."
     Disconnect-MountedShares
 }
 
 } catch {
-    Write-Error "Script failed: $_"
+    Write-Log "Script failed: $_" -Level ERROR -Color Red
     exit 1
 }
 
