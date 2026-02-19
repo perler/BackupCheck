@@ -13,6 +13,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: master
+          fetch-depth: 0
 
       - name: Extract version from tag
         id: version
@@ -37,7 +40,7 @@ jobs:
 
       - name: Update latest.json
         run: |
-          cat > latest.json <<EOF
+          cat > latest.json <<'ENDJSON'
           {
             "version": "${{ steps.version.outputs.version }}",
             "files": {
@@ -50,13 +53,12 @@ jobs:
             },
             "releaseUrl": "https://github.com/${{ github.repository }}/releases/download/v${{ steps.version.outputs.version }}/BackupCheck-v${{ steps.version.outputs.version }}.zip"
           }
-          EOF
+          ENDJSON
 
       - name: Commit latest.json
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git checkout master
           git add latest.json
           git diff --cached --quiet || git commit -m "Update latest.json for v${{ steps.version.outputs.version }}"
           git push origin master
