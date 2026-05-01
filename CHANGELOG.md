@@ -5,6 +5,39 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.2.0] - 2026-05-01
+
+### Added
+- **Coordinator-hosted updates**: monitor self-update can now pull manifests
+  and release zips from the coordinator (`/api/latest`, `/api/download/<file>`)
+  using the coordinator API key, instead of GitHub. GitHub raw remains as
+  fallback when no coordinator is configured.
+- **Release channels**: `latest-{channel}.json` schema with `stable` and
+  `canary` channels. Clients declare their channel via `config.channel`
+  (default `stable`).
+- **Admin publish endpoint** (`/api/admin/publish`): coordinator accepts
+  multipart uploads, computes SHA256 of release files, and writes per-channel
+  manifests. Gated by `COORDINATOR_ADMIN_KEY`.
+- **Version inventory** in `/api/status`: per-company current monitor version,
+  channel, and last-seen timestamp. Channel pointers also surfaced.
+- **`release.sh`**: workstation-side release script. Builds zip, posts to
+  `/api/admin/publish`. Replaces GitHub Actions for distribution.
+
+### Changed
+- Monitor reports `version` and `channel` in every `/api/report`.
+- Coordinator stores `monitor_channel` per report (with one-shot ALTER TABLE
+  migration on existing DBs).
+- Default update source: coordinator if configured, else legacy GitHub raw.
+- **Install path is now workstation-driven** (`install-client.sh`). The old
+  interactive PowerShell installer (`Install-BackupMonitor.ps1`) has been
+  removed.
+
+### Removed
+- `Install-BackupMonitor.ps1` — replaced by `install-client.sh`. Installs are
+  fully non-interactive: credentials sourced from IT Portal (`automat` user,
+  NAS account), workstation `.env` (HC keys, coordinator URL/key). Fails
+  loudly if `AD\automat` is missing in IT Portal for the target client.
+
 ## [2.1.0] - 2026-02-19
 
 ### Added

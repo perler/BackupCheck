@@ -13,10 +13,13 @@ services:
       - HC_PING_KEY=${HC_PING_KEY}
       - ATERA_API_KEY=${ATERA_API_KEY}
       - COORDINATOR_API_KEYS=${COORDINATOR_API_KEYS}
+      - COORDINATOR_ADMIN_KEY=${COORDINATOR_ADMIN_KEY}
       - COORDINATOR_DB=/data/coordinator.db
+      - COORDINATOR_RELEASES=/releases
       - ATERA_CACHE_SECONDS=900
     volumes:
       - coordinator-data:/data
+      - /vol/ssd/config/backupcheck-coordinator/releases:/releases
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:5000/api/health')"]
       interval: 60s

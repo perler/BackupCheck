@@ -11,6 +11,7 @@ Decision matrix:
   Backup FAIL + Agent Offline → skip ping (machine legitimately off)
 """
 
+import hashlib
 import json
 import logging
 import os
@@ -19,20 +20,26 @@ import sqlite3
 import time
 import urllib.error
 import urllib.request
+import zipfile
 from datetime import datetime, timezone
 from functools import wraps
+from pathlib import Path
 
-from flask import Flask, g, jsonify, request
+from flask import Flask, abort, g, jsonify, request, send_from_directory
 
 app = Flask(__name__)
 
 # Configuration
 DB_PATH = os.environ.get("COORDINATOR_DB", "/data/coordinator.db")
+RELEASES_DIR = Path(os.environ.get("COORDINATOR_RELEASES", "/releases"))
 HC_API_KEY = os.environ.get("HC_API_KEY", "")
 HC_PING_KEY = os.environ.get("HC_PING_KEY", "")
 ATERA_API_KEY = os.environ.get("ATERA_API_KEY", "")
 API_KEYS = [k.strip() for k in os.environ.get("COORDINATOR_API_KEYS", "").split(",") if k.strip()]
+ADMIN_KEY = os.environ.get("COORDINATOR_ADMIN_KEY", "")
 ATERA_CACHE_SECONDS = int(os.environ.get("ATERA_CACHE_SECONDS", "900"))  # 15 min
+COORDINATOR_VERSION = "2.2.0"
+VALID_CHANNELS = ("stable", "canary")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -73,6 +80,7 @@ def init_db():
             backup_count INTEGER DEFAULT 0,
             message TEXT,
             monitor_version TEXT,
+            monitor_channel TEXT,
             reported_at TEXT NOT NULL,
             processed_at TEXT,
             verdict TEXT
@@ -92,6 +100,12 @@ def init_db():
         CREATE INDEX IF NOT EXISTS idx_reports_reported_at
             ON reports (reported_at);
     """)
+    # Migration: add monitor_channel to existing tables (silently no-op if present)
+    try:
+        conn.execute("ALTER TABLE reports ADD COLUMN monitor_channel TEXT")
+    except sqlite3.OperationalError:
+        pass
+    conn.commit()
     conn.close()
 
 
@@ -110,13 +124,24 @@ def require_api_key(f):
     return decorated
 
 
+def require_admin_key(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        if not ADMIN_KEY:
+            return jsonify({"error": "admin key not configured"}), 503
+        if request.headers.get("X-Admin-Key", "") != ADMIN_KEY:
+            return jsonify({"error": "unauthorized"}), 401
+        return f(*args, **kwargs)
+    return decorated
+
+
 # --- Atera ---
 
 def _atera_request(url):
     """Make a request to the Atera API."""
     headers = {"X-API-KEY": ATERA_API_KEY, "Accept": "application/json"}
     req = urllib.request.Request(url, headers=headers)
-    req.add_header("User-Agent", "BackupCheck-Coordinator/2.1.0")
+    req.add_header("User-Agent", f"BackupCheck-Coordinator/{COORDINATOR_VERSION}")
     with urllib.request.urlopen(req, timeout=30) as resp:
         return json.loads(resp.read().decode())
 
@@ -214,7 +239,7 @@ def ping_hc(slug, success, message=""):
         data = message.encode("utf-8") if message else None
         req = urllib.request.Request(url, data=data, method="POST")
         req.add_header("Content-Type", "text/plain")
-        req.add_header("User-Agent", "BackupCheck-Coordinator/2.1.0")
+        req.add_header("User-Agent", f"BackupCheck-Coordinator/{COORDINATOR_VERSION}")
         with urllib.request.urlopen(req, timeout=10) as resp:
             return resp.status == 200
     except Exception as e:
@@ -234,6 +259,7 @@ def receive_report():
 
     company_id = data.get("companyId", "").lower()
     version = data.get("version", "unknown")
+    channel = data.get("channel", "stable")
     machines = data.get("machines", [])
 
     if not company_id:
@@ -266,10 +292,10 @@ def receive_report():
         db.execute(
             """INSERT INTO reports
                (company_id, machine_name, healthy, backup_age, backup_count,
-                message, monitor_version, reported_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                message, monitor_version, monitor_channel, reported_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (company_id, name, 1 if healthy else 0, backup_age,
-             backup_count, message, version, now),
+             backup_count, message, version, channel, now),
         )
 
         # Apply decision matrix
@@ -307,7 +333,7 @@ def receive_report():
     db.commit()
 
     log.info(
-        f"Report from {company_id} (v{version}): "
+        f"Report from {company_id} (v{version}/{channel}): "
         f"{len(machines)} machines, "
         f"{sum(1 for r in results if r['verdict'] == 'success')} ok, "
         f"{sum(1 for r in results if r['verdict'].startswith('fail'))} fail, "
@@ -322,7 +348,7 @@ def health_check():
     """Health check endpoint for monitoring the coordinator itself."""
     return jsonify({
         "status": "ok",
-        "version": "2.1.0",
+        "version": COORDINATOR_VERSION,
         "timestamp": datetime.now(timezone.utc).isoformat(),
     })
 
@@ -330,7 +356,7 @@ def health_check():
 @app.route("/api/status", methods=["GET"])
 @require_api_key
 def get_status():
-    """Get coordinator status and recent activity."""
+    """Get coordinator status and recent activity, including version inventory."""
     db = get_db()
 
     # Recent reports summary
@@ -345,18 +371,140 @@ def get_status():
            GROUP BY company_id"""
     ).fetchall()
 
+    # Per-company current version (latest report per company)
+    inventory = db.execute(
+        """SELECT r.company_id, r.monitor_version, r.monitor_channel, r.reported_at
+           FROM reports r
+           INNER JOIN (
+               SELECT company_id, MAX(reported_at) AS latest
+               FROM reports GROUP BY company_id
+           ) m ON r.company_id = m.company_id AND r.reported_at = m.latest"""
+    ).fetchall()
+    inv_by_company = {
+        row["company_id"]: {
+            "version": row["monitor_version"],
+            "channel": row["monitor_channel"] or "stable",
+            "last_seen": row["reported_at"],
+        }
+        for row in inventory
+    }
+
+    companies = []
+    for r in recent:
+        c = dict(r)
+        c["inventory"] = inv_by_company.get(r["company_id"], {})
+        companies.append(c)
+
     # Atera cache info
     cache_row = db.execute(
         "SELECT COUNT(*) as agents, MAX(cached_at) as last_refresh FROM atera_cache"
     ).fetchone()
 
+    # Channel pointers
+    channels = {}
+    for ch in VALID_CHANNELS:
+        manifest = _read_manifest(ch)
+        if manifest:
+            channels[ch] = manifest.get("version")
+
     return jsonify({
-        "companies": [dict(r) for r in recent],
+        "companies": companies,
         "atera_cache": {
             "agents": cache_row["agents"],
             "last_refresh": cache_row["last_refresh"],
         },
+        "channels": channels,
     })
+
+
+# --- Releases ---
+
+def _manifest_path(channel):
+    return RELEASES_DIR / f"latest-{channel}.json"
+
+
+def _read_manifest(channel):
+    p = _manifest_path(channel)
+    if not p.exists():
+        return None
+    try:
+        return json.loads(p.read_text())
+    except Exception as e:
+        log.error(f"Failed to read manifest for channel {channel}: {e}")
+        return None
+
+
+@app.route("/api/latest", methods=["GET"])
+@require_api_key
+def get_latest():
+    """Return the manifest for a channel. Empty object if no release published."""
+    channel = request.args.get("channel", "stable")
+    if channel not in VALID_CHANNELS:
+        return jsonify({"error": f"invalid channel; valid: {VALID_CHANNELS}"}), 400
+    manifest = _read_manifest(channel)
+    if not manifest:
+        return jsonify({})  # No release on this channel yet
+    return jsonify(manifest)
+
+
+@app.route("/api/download/<path:filename>", methods=["GET"])
+@require_api_key
+def download_release(filename):
+    """Stream a release zip from /releases. Filename is constrained to BackupCheck-v*.zip."""
+    if not re.fullmatch(r"BackupCheck-v[0-9A-Za-z.\-]+\.zip", filename):
+        abort(400)
+    if not (RELEASES_DIR / filename).exists():
+        abort(404)
+    return send_from_directory(RELEASES_DIR, filename, as_attachment=True)
+
+
+@app.route("/api/admin/publish", methods=["POST"])
+@require_admin_key
+def publish_release():
+    """Publish a new release. Multipart upload of the zip; form fields version + channel."""
+    version = request.form.get("version", "").strip()
+    channel = request.form.get("channel", "stable").strip()
+    if not re.fullmatch(r"\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.\-]+)?", version):
+        return jsonify({"error": "invalid version (use semver)"}), 400
+    if channel not in VALID_CHANNELS:
+        return jsonify({"error": f"invalid channel; valid: {VALID_CHANNELS}"}), 400
+    if "file" not in request.files:
+        return jsonify({"error": "missing file upload"}), 400
+
+    RELEASES_DIR.mkdir(parents=True, exist_ok=True)
+    zip_name = f"BackupCheck-v{version}.zip"
+    zip_path = RELEASES_DIR / zip_name
+    request.files["file"].save(zip_path)
+
+    # Compute SHA256 of the file(s) verified by the self-updater
+    files_meta = {}
+    try:
+        with zipfile.ZipFile(zip_path) as zf:
+            for name in ("Monitor-Backups.ps1",):
+                match = next((n for n in zf.namelist() if n.endswith(name)), None)
+                if not match:
+                    return jsonify({"error": f"{name} missing from zip"}), 400
+                with zf.open(match) as fh:
+                    files_meta[name] = {"sha256": hashlib.sha256(fh.read()).hexdigest()}
+    except zipfile.BadZipFile:
+        zip_path.unlink(missing_ok=True)
+        return jsonify({"error": "uploaded file is not a valid zip"}), 400
+
+    # External URL for download (clients fetch through reverse proxy).
+    # Honor X-Forwarded-Proto so https is preserved when behind GoDoxy.
+    scheme = request.headers.get("X-Forwarded-Proto", "").split(",")[0].strip() or request.scheme
+    host = request.headers.get("X-Forwarded-Host", request.host)
+    base = f"{scheme}://{host}"
+    manifest = {
+        "version": version,
+        "channel": channel,
+        "files": files_meta,
+        "releaseUrl": f"{base}/api/download/{zip_name}",
+        "publishedAt": datetime.now(timezone.utc).isoformat(),
+    }
+    _manifest_path(channel).write_text(json.dumps(manifest, indent=2))
+    log.info(f"Published v{version} to channel {channel}")
+    return jsonify({"status": "ok", "manifest": manifest})
 
 
 # --- Startup ---

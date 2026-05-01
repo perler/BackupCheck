@@ -11,7 +11,7 @@
     v2.1 adds: coordinator API integration with direct-ping fallback.
 
 .NOTES
-    Version: 2.1.0
+    Version: 2.2.0
     Requires: PowerShell 5.1+
 #>
 
@@ -33,7 +33,7 @@ $ErrorActionPreference = "Stop"
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
 # Script version
-$script:Version = "2.1.0"
+$script:Version = "2.2.0"
 
 # Track connections we've made for cleanup
 $script:MountedShares = @()
@@ -60,6 +60,7 @@ function Write-Log {
     #>
     param(
         [Parameter(Mandatory)]
+        [AllowEmptyString()]
         [string]$Message,
 
         [Parameter()]
@@ -563,13 +564,20 @@ function Send-HealthCheck {
 function Test-UpdateAvailable {
     <#
     .SYNOPSIS
-        Checks GitHub for a newer version of BackupCheck.
+        Checks for a newer version of BackupCheck. Supports coordinator (auth)
+        and legacy GitHub raw URL (no auth).
     .OUTPUTS
-        Returns update info hashtable if update available, $null otherwise.
+        Returns @{ Manifest = ...; ApiKey = ... } if update available, $null otherwise.
     #>
     param(
         [Parameter(Mandatory)]
-        [string]$RepoUrl
+        [string]$UpdateUrl,
+
+        [Parameter()]
+        [string]$ApiKey,
+
+        [Parameter()]
+        [string]$Channel = "stable"
     )
 
     # Check if we should skip (checked within last 24h)
@@ -587,15 +595,27 @@ function Test-UpdateAvailable {
     }
     catch { }
 
+    # Coordinator URL = ends with /api/latest. Otherwise treat as legacy GitHub raw base.
+    $isCoordinator = $UpdateUrl -match '/api/latest$'
+    $manifestUrl = if ($isCoordinator) { "${UpdateUrl}?channel=$Channel" } else { "$UpdateUrl/latest.json" }
+
     try {
-        Write-Log "Checking for updates..."
-        $latestJson = Invoke-RestMethod -Uri "$RepoUrl/latest.json" -TimeoutSec 10 -UseBasicParsing
+        Write-Log "Checking for updates from $manifestUrl..."
+        $headers = @{}
+        if ($isCoordinator -and $ApiKey) { $headers["X-API-Key"] = $ApiKey }
+        $latestJson = Invoke-RestMethod -Uri $manifestUrl -Headers $headers -TimeoutSec 10 -UseBasicParsing
+
+        if (-not $latestJson.version) {
+            Write-Log "No version in manifest (channel '$Channel' empty?)" -Level INFO
+            return $null
+        }
+
         $remoteVersion = [version]$latestJson.version
         $localVersion = [version]$script:Version
 
         if ($remoteVersion -gt $localVersion) {
             Write-Log "Update available: v$($script:Version) -> v$($latestJson.version)" -Level INFO -Color Cyan
-            return $latestJson
+            return @{ Manifest = $latestJson; ApiKey = $(if ($isCoordinator) { $ApiKey } else { "" }) }
         }
         else {
             Write-Log "Up to date (v$($script:Version))"
@@ -615,9 +635,11 @@ function Invoke-SelfUpdate {
     #>
     param(
         [Parameter(Mandatory)]
-        $UpdateInfo
+        $UpdateResult
     )
 
+    $UpdateInfo = $UpdateResult.Manifest
+    $apiKey = $UpdateResult.ApiKey
     $releaseUrl = $UpdateInfo.releaseUrl
     if (-not $releaseUrl) {
         Write-Log "No release URL in update info" -Level WARN -Color Yellow
@@ -628,9 +650,11 @@ function Invoke-SelfUpdate {
     $extractPath = Join-Path $env:TEMP "BackupCheck-update"
 
     try {
-        # Download the release zip
+        # Download the release zip (with auth for coordinator URLs)
         Write-Log "Downloading update from $releaseUrl..."
-        Invoke-WebRequest -Uri $releaseUrl -OutFile $zipPath -UseBasicParsing -TimeoutSec 60
+        $dlHeaders = @{}
+        if ($apiKey -and $releaseUrl -match '/api/download/') { $dlHeaders["X-API-Key"] = $apiKey }
+        Invoke-WebRequest -Uri $releaseUrl -Headers $dlHeaders -OutFile $zipPath -UseBasicParsing -TimeoutSec 60
 
         # Verify SHA256 of individual files after extraction
         if (Test-Path $extractPath) {
@@ -718,6 +742,7 @@ function Send-CoordinatorReport {
     $body = @{
         companyId = $CompanyId
         version = $script:Version
+        channel = $script:Channel
         machines = @($MachineResults | ForEach-Object {
             @{
                 name = $_.MachineName
@@ -791,18 +816,30 @@ if (-not $apiKey) {
     Write-Log "HC_API_KEY not found in $EnvPath - tags and caching will not work" -Level WARN -Color Yellow
 }
 
+# Channel for update + reporting (default stable)
+$script:Channel = if ($config.channel) { $config.channel } else { "stable" }
+
+# Coordinator config (used for both update source and reporting)
+$coordinatorUrl = if ($config.coordinatorUrl) { $config.coordinatorUrl } else { $envVars["COORDINATOR_URL"] }
+$coordinatorKey = if ($config.coordinatorApiKey) { $config.coordinatorApiKey } else { $envVars["COORDINATOR_API_KEY"] }
+
 # Self-update check
 if (-not $SkipUpdateCheck) {
-    $updateRepoUrl = if ($config.updateUrl) {
+    # Pick update source: explicit config > coordinator (if configured) > GitHub raw fallback
+    $updateUrl = if ($config.updateUrl) {
         $config.updateUrl
+    }
+    elseif ($coordinatorUrl -and $coordinatorKey) {
+        # Derive /api/latest from coordinator base URL (which ends in /api/report)
+        $coordinatorUrl -replace '/api/report$', '/api/latest'
     }
     else {
         "https://raw.githubusercontent.com/perler/BackupCheck/master"
     }
 
-    $updateInfo = Test-UpdateAvailable -RepoUrl $updateRepoUrl
-    if ($updateInfo) {
-        $updated = Invoke-SelfUpdate -UpdateInfo $updateInfo
+    $updateResult = Test-UpdateAvailable -UpdateUrl $updateUrl -ApiKey $coordinatorKey -Channel $script:Channel
+    if ($updateResult) {
+        $updated = Invoke-SelfUpdate -UpdateResult $updateResult
         if ($updated) {
             # Re-launch the updated script
             $relaunchArgs = @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "`"$($MyInvocation.MyCommand.Definition)`"", "-SkipUpdateCheck")
@@ -926,8 +963,6 @@ foreach ($repo in $repositories) {
 }
 
 # Phase 2: Report results - coordinator or direct HC pings
-$coordinatorUrl = if ($config.coordinatorUrl) { $config.coordinatorUrl } else { $envVars["COORDINATOR_URL"] }
-$coordinatorKey = if ($config.coordinatorApiKey) { $config.coordinatorApiKey } else { $envVars["COORDINATOR_API_KEY"] }
 $useDirectPing = $true
 
 if ($coordinatorUrl -and $coordinatorKey -and $results.Count -gt 0) {

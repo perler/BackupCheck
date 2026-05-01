@@ -9,5 +9,6 @@
   "runningFilePattern": "backup_running*",
   "healthchecksBaseUrl": "https://hc-ping.com",
   "autoDetectRepositories": true,
-  "tags": []
+  "tags": [],
+  "channel": "stable"
 }
