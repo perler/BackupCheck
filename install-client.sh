@@ -51,20 +51,21 @@ set -a; source "$REPO_ROOT/.env"; set +a
 : "${COORDINATOR_URL:?missing in .env}"
 : "${COORDINATOR_API_KEY:?missing in .env}"
 
-# --- 2. Read client agent.json ---
-AGENT_JSON="/home/work/clients/$CLIENT_CODE/.agent/agent.json"
-[[ -f "$AGENT_JSON" ]] || fail "Client context not found: $AGENT_JSON"
-AD_DOMAIN=$(python3 -c "import json,sys; d=json.load(open('$AGENT_JSON')); print(d.get('infrastructure',{}).get('ad_domain') or '')")
-[[ -n "$AD_DOMAIN" ]] || fail "infrastructure.ad_domain not set in $AGENT_JSON"
+# --- 2. SSH connectivity + auto-discover AD domain from target ---
+cyan "Client: $CLIENT_CODE  Target: $SSH_USER@$TARGET_HOST"
+# PowerShell over SSH is finicky with embedded quotes — use Write-Output of plain vars,
+# read back as two separate lines.
+PROBE_RAW=$(ssh -o ConnectTimeout=5 -o BatchMode=yes "$SSH_USER@$TARGET_HOST" \
+  'powershell -NoProfile -Command "Write-Output $env:COMPUTERNAME; Write-Output (Get-CimInstance Win32_ComputerSystem).Domain"' \
+  2>&1 | tr -d '\r') \
+  || fail "Cannot reach $SSH_USER@$TARGET_HOST over SSH"
+TARGET_HOSTNAME=$(echo "$PROBE_RAW" | sed -n '1p')
+AD_DOMAIN=$(echo "$PROBE_RAW" | sed -n '2p')
+[[ -n "$AD_DOMAIN" && "$AD_DOMAIN" != "$TARGET_HOSTNAME" ]] || fail "Could not auto-detect AD domain from $TARGET_HOST (USERDNSDOMAIN empty — is this server domain-joined?)"
+AD_DOMAIN=$(echo "$AD_DOMAIN" | tr 'A-Z' 'a-z')
 # AD short name = first label (ad.pro-return.de → ad)
 AD_SHORT=$(echo "$AD_DOMAIN" | cut -d. -f1)
-
-cyan "Client: $CLIENT_CODE  Target: $SSH_USER@$TARGET_HOST  AD: $AD_DOMAIN"
-
-# --- 3. SSH connectivity check ---
-ssh -o ConnectTimeout=5 -o BatchMode=yes "$SSH_USER@$TARGET_HOST" 'powershell -NoProfile -Command "$env:COMPUTERNAME"' >/dev/null \
-  || fail "Cannot reach $SSH_USER@$TARGET_HOST over SSH"
-green "  SSH OK"
+green "  SSH OK ($TARGET_HOSTNAME, AD: $AD_DOMAIN)"
 
 # --- 4a. AD\automat password lookup ---
 # IT Portal has a first-class "Object Account" concept (type "AD Accounts") that is
@@ -129,62 +130,7 @@ EOF
 }
 green "  AD\\automat password retrieved"
 
-# --- 4b. NAS credential lookup ---
-# Resolve via the IT Portal REST API directly (same pattern as automat above):
-#   /Companies/?abbreviation=<CODE>           → company.id
-#   /Devices/?company=<id>                    → list this client's devices
-#   /AdditionalCredentials/?portalObject_id=<deviceId>&portalObject_itemType=Device
-#                                              → creds attached to each device
-# Find the device that has a backup/backupadmin user and use its credential.
-# The skill's `info <code>` shortcut is buggy (lowercase falls through to fuzzy
-# matches) — never use it for credential resolution.
-cyan "Looking up NAS credentials in IT Portal..."
-NAS_CREDS_JSON=$(cd "$ITPORTAL_DIR" && node -e "
-const config = require('./config').load();
-const axios = require('axios');
-const code = '$CLIENT_CODE';
-const http = axios.create({ baseURL: config.baseURL, headers: { Authorization: config.apiKey } });
-(async () => {
-  const cR = await http.get('/Companies/', { params: { abbreviation: code } });
-  const company = cR.data.data.results[0];
-  if (!company) { console.error('NOT_FOUND'); process.exit(3); }
-  const AC = require('./itportal-additional-creds');
-  const ac = new AC();
-  const all = await ac._fetchAll();
-  // Get this company's device IDs by fetching the Devices listing
-  const myDevices = new Map();
-  let cursor = null;
-  do {
-    const dR = await http.get('/Devices/', { params: { companyId: company.id, limit: 100, ...(cursor ? { cursor } : {}) } });
-    for (const d of dR.data.data.results) myDevices.set(d.id, d.name);
-    cursor = dR.data.data.nextCursor;
-  } while (cursor && myDevices.size < 1000);
-  // Find creds with username backup/backupadmin attached to one of this company's devices
-  const mine = all.filter(c =>
-    c.portalObject.itemType === 'Device' &&
-    myDevices.has(c.portalObject.id) &&
-    ['backup', 'backupadmin'].includes((c.username || '').toLowerCase())
-  );
-  if (mine.length === 0) { console.error('NOT_FOUND'); process.exit(3); }
-  // Prefer backupadmin
-  const pref = mine.find(c => (c.username || '').toLowerCase() === 'backupadmin') || mine[0];
-  process.stdout.write(JSON.stringify({
-    user: pref.username, pass: pref.password,
-    device: myDevices.get(pref.portalObject.id) || pref.portalObject.itemName
-  }));
-})().catch(e => { console.error('ERR:' + (e.response?.data ? JSON.stringify(e.response.data) : e.message)); process.exit(5); });
-" 2>&1) || {
-  if [[ "$NAS_CREDS_JSON" == "NOT_FOUND" ]]; then
-    fail "No NAS user 'backup' or 'backupadmin' found for $CLIENT_CODE in IT Portal."
-  fi
-  fail "NAS lookup failed: $NAS_CREDS_JSON"
-}
-NAS_USER=$(echo "$NAS_CREDS_JSON" | python3 -c "import json,sys; print(json.load(sys.stdin)['user'])")
-NAS_PASS=$(echo "$NAS_CREDS_JSON" | python3 -c "import json,sys; print(json.load(sys.stdin)['pass'])")
-NAS_DEVICE=$(echo "$NAS_CREDS_JSON" | python3 -c "import json,sys; print(json.load(sys.stdin)['device'])")
-green "  NAS credentials: $NAS_DEVICE\\$NAS_USER"
-
-# --- 5. Detect Macrium repos via mrserver.exe ---
+# --- 4b. Detect Macrium repos (needed before NAS lookup so we know which NAS to authenticate) ---
 cyan "Detecting Macrium repositories on $TARGET_HOST..."
 REPOS_CSV=$(ssh "$SSH_USER@$TARGET_HOST" 'powershell -NoProfile -Command "& \"C:\Program Files\Macrium\SiteManager\mrserver.exe\" --action get-repo-status --outputtoconsole 2>$null"' || true)
 REPOS_RAW=$(printf '%s' "$REPOS_CSV" | python3 -c "
@@ -206,8 +152,76 @@ while IFS= read -r line; do
     [[ -n "$line" ]] && REPOS+=("$line")
 done <<< "$REPOS_RAW"
 [[ ${#REPOS[@]} -gt 0 ]] || fail "No Macrium repositories detected. Is Macrium Site Manager installed and configured?"
-green "  Found ${#REPOS[@]} repository(ies):"
+
+NAS_SERVERS=$(printf '%s\n' "${REPOS[@]}" | sed -E 's@^\\\\([^\\]+)\\.*@\1@' | sort -u)
+NAS_SERVER_COUNT=$(echo "$NAS_SERVERS" | wc -l)
+[[ "$NAS_SERVER_COUNT" -eq 1 ]] || fail "Repositories span multiple NAS servers — this installer expects one: $NAS_SERVERS"
+NAS_HOSTNAME=$(echo "$NAS_SERVERS" | head -1)
+green "  Found ${#REPOS[@]} repository(ies) on \\\\${NAS_HOSTNAME}:"
 for r in "${REPOS[@]}"; do echo "    - $r"; done
+
+# --- 4c. NAS credential lookup ---
+# Resolve via the IT Portal REST API directly (same pattern as automat above):
+#   /Companies/?abbreviation=<CODE>           → company.id
+#   /Devices/?company=<id>                    → list this client's devices
+#   /AdditionalCredentials/?portalObject_id=<deviceId>&portalObject_itemType=Device
+#                                              → creds attached to each device
+# Find the device that has a backup/backupadmin user and use its credential.
+# The skill's `info <code>` shortcut is buggy (lowercase falls through to fuzzy
+# matches) — never use it for credential resolution.
+cyan "Looking up NAS credentials in IT Portal for \\\\${NAS_HOSTNAME}..."
+NAS_CREDS_JSON=$(cd "$ITPORTAL_DIR" && NAS_HOSTNAME="$NAS_HOSTNAME" CLIENT_CODE="$CLIENT_CODE" node -e "
+const config = require('./config').load();
+const axios = require('axios');
+const code = process.env.CLIENT_CODE;
+const nasHost = process.env.NAS_HOSTNAME.toLowerCase();
+const http = axios.create({ baseURL: config.baseURL, headers: { Authorization: config.apiKey } });
+(async () => {
+  const cR = await http.get('/Companies/', { params: { abbreviation: code } });
+  const company = cR.data.data.results[0];
+  if (!company) { console.error('NOT_FOUND'); process.exit(3); }
+  const AC = require('./itportal-additional-creds');
+  const ac = new AC();
+  const all = await ac._fetchAll();
+  // Get this company's devices and find the one matching the actual NAS hostname
+  // (case-insensitive name match on the value mrserver.exe returned in the UNC path).
+  const myDevices = new Map();
+  let cursor = null;
+  do {
+    const dR = await http.get('/Devices/', { params: { companyId: company.id, limit: 100, ...(cursor ? { cursor } : {}) } });
+    for (const d of dR.data.data.results) myDevices.set(d.id, d.name);
+    cursor = dR.data.data.nextCursor;
+  } while (cursor && myDevices.size < 1000);
+  const matchingDeviceIds = [...myDevices.entries()]
+    .filter(([id, name]) => (name || '').toLowerCase() === nasHost || (name || '').toLowerCase().startsWith(nasHost + '.'))
+    .map(([id]) => id);
+  if (matchingDeviceIds.length === 0) {
+    console.error('NO_DEVICE:' + nasHost);
+    process.exit(3);
+  }
+  const mine = all.filter(c =>
+    c.portalObject.itemType === 'Device' &&
+    matchingDeviceIds.includes(c.portalObject.id) &&
+    ['backup', 'backupadmin'].includes((c.username || '').toLowerCase())
+  );
+  if (mine.length === 0) { console.error('NO_CREDS_ON:' + nasHost); process.exit(3); }
+  // Prefer backupadmin
+  const pref = mine.find(c => (c.username || '').toLowerCase() === 'backupadmin') || mine[0];
+  process.stdout.write(JSON.stringify({
+    user: pref.username, pass: pref.password,
+    device: myDevices.get(pref.portalObject.id) || pref.portalObject.itemName
+  }));
+})().catch(e => { console.error('ERR:' + (e.response?.data ? JSON.stringify(e.response.data) : e.message)); process.exit(5); });
+" 2>&1) || {
+  if [[ "$NAS_CREDS_JSON" == "NOT_FOUND" ]]; then
+    fail "No NAS user 'backup' or 'backupadmin' found for $CLIENT_CODE in IT Portal."
+  fi
+  fail "NAS lookup failed: $NAS_CREDS_JSON"
+}
+NAS_USER=$(echo "$NAS_CREDS_JSON" | python3 -c "import json,sys; print(json.load(sys.stdin)['user'])")
+NAS_PASS=$(echo "$NAS_CREDS_JSON" | python3 -c "import json,sys; print(json.load(sys.stdin)['pass'])")
+NAS_DEVICE=$(echo "$NAS_CREDS_JSON" | python3 -c "import json,sys; print(json.load(sys.stdin)['device'])")
+green "  NAS credentials: $NAS_DEVICE\\$NAS_USER"
 
 if [[ $DRY_RUN -eq 1 ]]; then
   cyan "[dry-run] Would now write config + .env, install task. Stopping."
@@ -272,8 +286,8 @@ cat > "$TMPDIR/run-install.ps1" <<'REMOTEEOF'
 $ErrorActionPreference = "Stop"
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 $installDir = "C:\BackupCheck"
-$userHome = $env:USERPROFILE
-$args = Get-Content (Join-Path $userHome "install-args.json") -Raw | ConvertFrom-Json
+$staging = "C:\BackupCheck-staging"
+$args = Get-Content (Join-Path $staging "install-args.json") -Raw | ConvertFrom-Json
 New-Item -ItemType Directory -Path $installDir -Force | Out-Null
 
 # Download release zip
@@ -283,8 +297,8 @@ Expand-Archive -Path $zipPath -DestinationPath $installDir -Force
 Remove-Item $zipPath -Force
 
 # Move config + .env into place
-Move-Item -Force (Join-Path $userHome "config.json") (Join-Path $installDir "config.json")
-Move-Item -Force (Join-Path $userHome ".env")        (Join-Path $installDir ".env")
+Move-Item -Force (Join-Path $staging "config.json") (Join-Path $installDir "config.json")
+Move-Item -Force (Join-Path $staging ".env")        (Join-Path $installDir ".env")
 
 # Register/replace scheduled task
 $taskName = "BackupMonitor"
@@ -306,19 +320,21 @@ Register-ScheduledTask -TaskName $taskName `
 
 Write-Host "Scheduled task BackupMonitor registered as $($args.TaskUser)" -ForegroundColor Green
 
-# Wipe install-args.json now that the task is registered
-Remove-Item (Join-Path $userHome "install-args.json") -Force
+# (Staging directory is wiped by the caller after this script returns)
 
 # Trigger an immediate run for verification
 Start-ScheduledTask -TaskName $taskName
 Write-Host "Triggered first run." -ForegroundColor Green
 REMOTEEOF
 
+# Stage files in C:\BackupCheck-staging\ (a fixed, predictable path that doesn't depend on
+# the actual SSH user's profile directory — admin.AD vs admin etc.)
+ssh "$SSH_USER@$TARGET_HOST" 'powershell -NoProfile -Command "New-Item -ItemType Directory -Path C:\BackupCheck-staging -Force | Out-Null"' >/dev/null
 scp -q "$TMPDIR/config.json" "$TMPDIR/.env" "$TMPDIR/install-args.json" "$TMPDIR/run-install.ps1" \
-    "$SSH_USER@$TARGET_HOST:C:/Users/$SSH_USER/"
+    "$SSH_USER@$TARGET_HOST:C:/BackupCheck-staging/"
 
-ssh "$SSH_USER@$TARGET_HOST" "powershell -NoProfile -ExecutionPolicy Bypass -File C:/Users/$SSH_USER/run-install.ps1"
-ssh "$SSH_USER@$TARGET_HOST" "powershell -NoProfile -Command \"Remove-Item C:/Users/$SSH_USER/run-install.ps1 -Force -EA SilentlyContinue\""
+ssh "$SSH_USER@$TARGET_HOST" "powershell -NoProfile -ExecutionPolicy Bypass -File C:/BackupCheck-staging/run-install.ps1"
+ssh "$SSH_USER@$TARGET_HOST" 'powershell -NoProfile -Command "Remove-Item C:\BackupCheck-staging -Recurse -Force -EA SilentlyContinue"'
 
 # --- 8. Wait briefly + verify on coordinator ---
 green "  Install complete. Waiting 15s for first run to report..."
