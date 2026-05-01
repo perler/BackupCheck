@@ -25,8 +25,8 @@ jobs:
         run: |
           mkdir -p release
           cp Monitor-Backups.ps1 release/
-          cp Install-BackupMonitor.ps1 release/
-          cp .env.example release/
+          cp upgrade.ps1 release/
+          cp config.example.json release/
           cp README.md release/
           cp LICENSE release/
           cp CHANGELOG.md release/
@@ -36,7 +36,6 @@ jobs:
         id: checksums
         run: |
           echo "monitor_sha256=$(sha256sum release/Monitor-Backups.ps1 | cut -d' ' -f1)" >> $GITHUB_OUTPUT
-          echo "installer_sha256=$(sha256sum release/Install-BackupMonitor.ps1 | cut -d' ' -f1)" >> $GITHUB_OUTPUT
 
       - name: Update latest.json
         run: |
@@ -46,9 +45,6 @@ jobs:
             "files": {
               "Monitor-Backups.ps1": {
                 "sha256": "${{ steps.checksums.outputs.monitor_sha256 }}"
-              },
-              "Install-BackupMonitor.ps1": {
-                "sha256": "${{ steps.checksums.outputs.installer_sha256 }}"
               }
             },
             "releaseUrl": "https://github.com/${{ github.repository }}/releases/download/v${{ steps.version.outputs.version }}/BackupCheck-v${{ steps.version.outputs.version }}.zip"
