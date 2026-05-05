@@ -19,6 +19,7 @@ import re
 import sqlite3
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import zipfile
 from datetime import datetime, timezone
@@ -38,7 +39,7 @@ ATERA_API_KEY = os.environ.get("ATERA_API_KEY", "")
 API_KEYS = [k.strip() for k in os.environ.get("COORDINATOR_API_KEYS", "").split(",") if k.strip()]
 ADMIN_KEY = os.environ.get("COORDINATOR_ADMIN_KEY", "")
 ATERA_CACHE_SECONDS = int(os.environ.get("ATERA_CACHE_SECONDS", "900"))  # 15 min
-COORDINATOR_VERSION = "2.2.0"
+COORDINATOR_VERSION = "2.2.1"
 VALID_CHANNELS = ("stable", "canary")
 
 logging.basicConfig(
@@ -84,6 +85,12 @@ def init_db():
             reported_at TEXT NOT NULL,
             processed_at TEXT,
             verdict TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS hc_check_uuids (
+            slug TEXT PRIMARY KEY,
+            uuid TEXT NOT NULL,
+            cached_at TEXT NOT NULL
         );
 
         CREATE TABLE IF NOT EXISTS atera_cache (
@@ -233,7 +240,8 @@ def ping_hc(slug, success, message=""):
         return False
 
     suffix = "" if success else "/fail"
-    url = f"https://hc-ping.com/{HC_PING_KEY}/{slug}{suffix}?create=1"
+    encoded_slug = urllib.parse.quote(slug, safe="-")
+    url = f"https://hc-ping.com/{HC_PING_KEY}/{encoded_slug}{suffix}?create=1"
 
     try:
         data = message.encode("utf-8") if message else None
@@ -244,6 +252,76 @@ def ping_hc(slug, success, message=""):
             return resp.status == 200
     except Exception as e:
         log.error(f"HC ping failed for {slug}: {e}")
+        return False
+
+
+def _hc_api_request(url, method="GET", data=None):
+    """Call the HC management API. Returns parsed JSON, or None on error."""
+    if not HC_API_KEY:
+        return None
+    headers = {"X-Api-Key": HC_API_KEY}
+    body = None
+    if data is not None:
+        headers["Content-Type"] = "application/json"
+        body = json.dumps(data).encode()
+    req = urllib.request.Request(url, headers=headers, method=method, data=body)
+    req.add_header("User-Agent", f"BackupCheck-Coordinator/{COORDINATOR_VERSION}")
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        text = resp.read().decode()
+        return json.loads(text) if text else {}
+
+
+def get_hc_uuid(db, slug):
+    """Resolve a check slug to its UUID via the HC management API, with DB cache.
+
+    Returns None if the check doesn't exist yet (never pinged) or HC_API_KEY missing.
+    """
+    if not HC_API_KEY:
+        return None
+
+    row = db.execute(
+        "SELECT uuid FROM hc_check_uuids WHERE slug = ?", (slug,)
+    ).fetchone()
+    if row:
+        return row["uuid"]
+
+    encoded = urllib.parse.quote(slug, safe="-")
+    url = f"https://healthchecks.io/api/v3/checks/?slug={encoded}"
+    try:
+        data = _hc_api_request(url)
+    except Exception as e:
+        log.error(f"HC slug lookup failed for {slug}: {e}")
+        return None
+    if not data:
+        return None
+
+    checks = data.get("checks", [])
+    match = next((c for c in checks if c.get("slug") == slug), None)
+    if not match:
+        return None
+
+    uuid = match.get("uuid")
+    if not uuid:
+        return None
+    db.execute(
+        "INSERT OR REPLACE INTO hc_check_uuids (slug, uuid, cached_at) VALUES (?, ?, ?)",
+        (slug, uuid, datetime.now(timezone.utc).isoformat()),
+    )
+    return uuid
+
+
+def pause_hc(db, slug):
+    """Pause a HC check via the management API. Auto-resumes on next ping
+    (manual_resume=False is the default). No-op if check doesn't exist."""
+    uuid = get_hc_uuid(db, slug)
+    if not uuid:
+        return False
+    url = f"https://healthchecks.io/api/v3/checks/{uuid}/pause"
+    try:
+        _hc_api_request(url, method="POST")
+        return True
+    except Exception as e:
+        log.error(f"HC pause failed for {slug}: {e}")
         return False
 
 
@@ -317,8 +395,14 @@ def receive_report():
             ping_hc(slug, False, f"[Coordinator] {message}")
         else:
             # Backup missing + agent offline → skip (machine legitimately off)
+            # Pause the HC check so the dashboard shows "paused" instead of stale "down".
+            # HC auto-resumes on the next ping (manual_resume=False default).
             verdict = "skipped_offline"
-            log.info(f"{slug}: skipping ping - agent offline, backup missing")
+            paused = pause_hc(db, slug)
+            log.info(
+                f"{slug}: skipping ping - agent offline, backup missing"
+                + (" (paused)" if paused else "")
+            )
 
         # Update report with verdict
         db.execute(

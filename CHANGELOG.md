@@ -5,6 +5,27 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.2.1] - 2026-05-05
+
+### Fixed
+- **Coordinator URL-encodes slugs when pinging healthchecks.io.** Machine names
+  containing spaces or other URL-unsafe characters previously caused a hard
+  error and silent missed pings (e.g. `stph-storage analyzer`).
+
+### Changed
+- **Coordinator pauses HC checks on `skipped_offline`.** When a notebook/
+  workstation's Atera agent is offline and no recent backup exists, the
+  coordinator now calls the HC management API to pause the check so the
+  dashboard reflects reality instead of stale "down". Checks auto-resume on
+  the next ping (HC `manual_resume=false` default).
+- Retires the orbit-cron `pause-offline-checks.py` job — its responsibility
+  (suppressing alerts for offline machines) is now handled inline by the
+  coordinator. The script remains in-repo for reference and one-shot recovery.
+
+### Added
+- New `hc_check_uuids` table caches slug→uuid lookups so pause is one API
+  call per check after the first.
+
 ## [2.2.0] - 2026-05-01
 
 ### Added
