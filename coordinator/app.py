@@ -25,6 +25,9 @@ import zipfile
 from datetime import datetime, timezone
 from functools import wraps
 from pathlib import Path
+from zoneinfo import ZoneInfo
+
+LOCAL_TZ = ZoneInfo("Europe/Berlin")
 
 from flask import Flask, abort, g, jsonify, request, send_from_directory
 
@@ -39,7 +42,12 @@ ATERA_API_KEY = os.environ.get("ATERA_API_KEY", "")
 API_KEYS = [k.strip() for k in os.environ.get("COORDINATOR_API_KEYS", "").split(",") if k.strip()]
 ADMIN_KEY = os.environ.get("COORDINATOR_ADMIN_KEY", "")
 ATERA_CACHE_SECONDS = int(os.environ.get("ATERA_CACHE_SECONDS", "900"))  # 15 min
-COORDINATOR_VERSION = "2.2.1"
+COORDINATOR_VERSION = "2.2.3"
+
+# Online-hour thresholds for notebooks/workstations: how many hourly reports
+# we must see (since the last successful backup) before flipping a missing
+# backup from "warming up" (paused) to "fail". Servers fail immediately.
+ONLINE_HOUR_THRESHOLDS = {"nb": 48, "wks": 36}
 VALID_CHANNELS = ("stable", "canary")
 
 logging.basicConfig(
@@ -233,6 +241,62 @@ def is_cache_stale(db):
 
 # --- Healthchecks.io ---
 
+def _device_prefix(name):
+    """Return the device-type prefix ('nb', 'wks', 'srv') or None."""
+    for p in ("nb", "wks", "srv"):
+        if name.startswith(p):
+            return p
+    return None
+
+
+def online_hours_since_success(db, company_id, name):
+    """Count reports for (company, machine) since the most recent success
+    verdict. ~1 row per hour while the agent is online, so this approximates
+    online-hours since the last good backup."""
+    row = db.execute(
+        """SELECT MAX(reported_at) AS last_success FROM reports
+           WHERE company_id = ? AND machine_name = ? AND verdict = 'success'""",
+        (company_id, name),
+    ).fetchone()
+    last_success = row["last_success"] if row else None
+    # Only count reports where the device was actually online — exclude
+    # skipped_offline (vacation/powered-off rows shouldn't burn the budget).
+    base = (
+        "SELECT COUNT(*) AS n FROM reports "
+        "WHERE company_id = ? AND machine_name = ? "
+        "AND (verdict IS NULL OR verdict != 'skipped_offline')"
+    )
+    if last_success:
+        cnt = db.execute(
+            base + " AND reported_at > ?", (company_id, name, last_success)
+        ).fetchone()
+    else:
+        cnt = db.execute(base, (company_id, name)).fetchone()
+    return cnt["n"] if cnt else 0
+
+
+def _format_last_seen(last_seen):
+    """Format an Atera LastSeen timestamp as ' but client was seen last time
+    X hours and YY minutes ago (YYYY-MM-DD HH:MM)'. Returns '' on parse failure."""
+    if not last_seen:
+        return ""
+    try:
+        ts = datetime.fromisoformat(last_seen.replace("Z", "+00:00"))
+    except ValueError:
+        return ""
+    delta = datetime.now(timezone.utc) - ts
+    total_minutes = max(int(delta.total_seconds() // 60), 0)
+    hours, minutes = divmod(total_minutes, 60)
+    if hours and minutes:
+        ago = f"{hours} hours and {minutes:02d} minutes ago"
+    elif hours:
+        ago = f"{hours} hours ago"
+    else:
+        ago = f"{minutes} minutes ago"
+    local_ts = ts.astimezone(LOCAL_TZ).strftime("%Y-%m-%d %H:%M")
+    return f" but client was seen last time {ago} ({local_ts})"
+
+
 def ping_hc(slug, success, message=""):
     """Send a ping to healthchecks.io."""
     if not HC_PING_KEY:
@@ -390,9 +454,31 @@ def receive_report():
             ping_hc(slug, False, f"[Coordinator] {message}")
             log.warning(f"{slug}: no Atera data, forwarding failure")
         elif agent_online:
-            # Backup missing + agent online → real problem
-            verdict = "fail"
-            ping_hc(slug, False, f"[Coordinator] {message}")
+            # Backup missing + agent online. For notebooks/workstations,
+            # only fail once enough online-hours have accumulated since the
+            # last good backup — otherwise the device may simply have just
+            # powered on and not had time to back up yet.
+            prefix = _device_prefix(name)
+            threshold = ONLINE_HOUR_THRESHOLDS.get(prefix)
+            online_h = online_hours_since_success(db, company_id, name)
+            last_seen_suffix = _format_last_seen(agent.get("last_seen"))
+            if threshold is not None and online_h < threshold:
+                verdict = "warming_up"
+                paused = pause_hc(db, slug)
+                log.info(
+                    f"{slug}: warming up - {online_h}/{threshold} online-hours "
+                    f"since last success" + (" (paused)" if paused else "")
+                )
+            else:
+                verdict = "fail"
+                online_suffix = (
+                    f" Client has been online ~{online_h} hours since the "
+                    f"last successful backup."
+                )
+                ping_hc(
+                    slug, False,
+                    f"[Coordinator] {message}{last_seen_suffix}{online_suffix}",
+                )
         else:
             # Backup missing + agent offline → skip (machine legitimately off)
             # Pause the HC check so the dashboard shows "paused" instead of stale "down".
@@ -421,7 +507,8 @@ def receive_report():
         f"{len(machines)} machines, "
         f"{sum(1 for r in results if r['verdict'] == 'success')} ok, "
         f"{sum(1 for r in results if r['verdict'].startswith('fail'))} fail, "
-        f"{sum(1 for r in results if r['verdict'].startswith('skip'))} skipped"
+        f"{sum(1 for r in results if r['verdict'].startswith('skip'))} skipped, "
+        f"{sum(1 for r in results if r['verdict'] == 'warming_up')} warming-up"
     )
 
     return jsonify({"status": "ok", "results": results})
