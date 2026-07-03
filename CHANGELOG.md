@@ -5,6 +5,23 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.2.4] - 2026-07-03
+
+### Fixed
+- **No more explicit `/fail` flood for stale (but not corrupt) workstation and
+  notebook backups.** When a machine is online and its newest image is older
+  than `backupMaxAgeHours` (24h) but the repository is intact, the monitor no
+  longer pings the healthchecks.io failure endpoint. An explicit failure signal
+  flips the HC check DOWN immediately and defeats the check's own Period
+  tolerance (wks 4d / nb 8d + grace), so laptops and workstations that
+  legitimately go days between images were generating nightly waves of false
+  "DOWN | ... — No backups found within last 24 hours" alerts across every
+  client. These devices are now **skipped** (no ping sent); if backups genuinely
+  stop, the HC Period+grace still raises the alarm within the intended window.
+- **Servers (`srv*`) keep the explicit failure ping** — they are expected to
+  back up daily and are latency-critical, so fast detection is preserved.
+- Corrupt-backup detection (`.error_loading`) is unchanged and still fails hard.
+
 ## [2.2.1] - 2026-05-05
 
 ### Fixed

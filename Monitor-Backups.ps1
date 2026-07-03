@@ -33,7 +33,7 @@ $ErrorActionPreference = "Stop"
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
 # Script version
-$script:Version = "2.2.0"
+$script:Version = "2.2.4"
 
 # Track connections we've made for cleanup
 $script:MountedShares = @()
@@ -945,8 +945,24 @@ foreach ($repo in $repositories) {
             $successCount++
         }
         else {
-            Write-Log "  [FAIL] $($health.MachineName): $statusDetail" -Level FAIL -Color Red
-            $failCount++
+            # No backup within the threshold, but the machine is online and the
+            # backups are not corrupt. Servers are expected to back up daily and
+            # are latency-critical, so keep the explicit failure ping for them.
+            # Workstations/notebooks (and non-standard names) legitimately go days
+            # between images; an explicit /fail here flips the HC check DOWN
+            # immediately and defeats the check's own Period tolerance
+            # (wks 4d / nb 8d + grace), flooding alerts. Skip instead and let the
+            # HC Period+grace raise the alarm if backups genuinely stop.
+            $devType = (Get-DeviceTypeSettings -MachineName $health.MachineName).Tag
+            if ($devType -eq 'srv') {
+                Write-Log "  [FAIL] $($health.MachineName): $statusDetail" -Level FAIL -Color Red
+                $failCount++
+            }
+            else {
+                Write-Log "  [SKIP] $($health.MachineName): $statusDetail (stale; deferring to HC period)" -Level SKIP -Color DarkGray
+                $skipCount++
+                continue
+            }
         }
 
         $results += @{
