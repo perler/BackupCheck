@@ -1,9 +1,9 @@
 {
-  "version": "2.2.0",
+  "version": "2.2.4",
   "files": {
     "Monitor-Backups.ps1": {
-      "sha256": "11dce05436901d3f36adcaae4b8f4b04a58be03297e49602b45975de87410949"
+      "sha256": "23818c7b0440ff6c03a33f1eea38e0382b61b28b15908a4cd503234f10a2bbf1"
     }
   },
-  "releaseUrl": "https://github.com/perler/BackupCheck/releases/download/v2.2.0/BackupCheck-v2.2.0.zip"
+  "releaseUrl": "https://github.com/perler/BackupCheck/releases/download/v2.2.4/BackupCheck-v2.2.4.zip"
 }
