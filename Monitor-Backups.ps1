@@ -33,7 +33,7 @@ $ErrorActionPreference = "Stop"
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
 # Script version
-$script:Version = "2.2.4"
+$script:Version = "2.2.5"
 
 # Track connections we've made for cleanup
 $script:MountedShares = @()
@@ -301,6 +301,7 @@ function Test-BackupHealth {
         Path = $Path
         MachineName = Split-Path $Path -Leaf
         IsHealthy = $false
+        IsFresh = $false
         IsSkipped = $false
         SkipReason = $null
         LatestBackup = $null
@@ -337,12 +338,17 @@ function Test-BackupHealth {
 
     $result.BackupCount = ($backupFiles | Measure-Object).Count
 
-    if ($result.BackupCount -gt 0 -and -not $result.HasErrorFiles) {
+    if ($result.BackupCount -gt 0) {
         $latestFile = $backupFiles | Sort-Object LastWriteTime -Descending | Select-Object -First 1
         $result.LatestBackup = $latestFile.FullName
         $result.BackupAge = [math]::Round(((Get-Date) - $latestFile.LastWriteTime).TotalHours, 1)
-        $result.IsHealthy = $true
+        $result.IsFresh = $true
     }
+
+    # Freshness is evaluated independently of corruption so that a repository
+    # with .error_loading files cannot mask a stopped backup. Healthy still
+    # requires both conditions, so a corrupt repo continues to fail.
+    $result.IsHealthy = ($result.IsFresh -and -not $result.HasErrorFiles)
 
     return $result
 }
@@ -925,22 +931,29 @@ foreach ($repo in $repositories) {
             continue
         }
 
-        # Build status message
-        $statusDetail = if ($health.HasErrorFiles) {
-            "ERROR: $($health.ErrorFileCount) corrupted backup file(s) detected (.error_loading)"
-        }
-        elseif ($health.IsHealthy) {
+        # Build status message. Corruption and staleness are independent
+        # conditions, so report both. Previously corruption short-circuited the
+        # message and a genuine backup stoppage was indistinguishable from a
+        # .error_loading alert for as long as the corruption persisted.
+        $freshDetail = if ($health.IsFresh) {
             "Last backup: $($health.BackupAge)h ago ($($health.BackupCount) files within threshold)"
         }
         else {
             "No backups found within last $($config.backupMaxAgeHours) hours"
         }
 
+        $statusDetail = if ($health.HasErrorFiles) {
+            "ERROR: $($health.ErrorFileCount) corrupted backup file(s) detected (.error_loading); $freshDetail"
+        }
+        else {
+            $freshDetail
+        }
+
         if ($health.HasErrorFiles) {
             Write-Log "  [ERR]  $($health.MachineName): $statusDetail" -Level FAIL -Color Magenta
             $failCount++
         }
-        elseif ($health.IsHealthy) {
+        elseif ($health.IsFresh) {
             Write-Log "  [OK]   $($health.MachineName): $statusDetail" -Level OK -Color Green
             $successCount++
         }

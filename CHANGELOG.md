@@ -5,6 +5,28 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.2.5] - 2026-07-21
+
+### Fixed
+- **Corrupt repositories no longer mask backup staleness.** `HasErrorFiles` was
+  evaluated before `IsHealthy` when building the status message, so a
+  `.error_loading` file short-circuited the freshness verdict: a machine that had
+  stopped backing up entirely reported the *same* message as one backing up
+  normally with a corrupt file present. The two states were indistinguishable
+  for as long as the corruption persisted — on PR SRV003 that was 34 days
+  (2026-06-13 → 07-18). Freshness is now computed independently of corruption
+  and both conditions are reported together, e.g. `ERROR: 1 corrupted backup
+  file(s) detected (.error_loading); No backups found within last 24 hours`.
+- `BackupAge` / `LatestBackup` are now populated even when error files are
+  present (previously left `$null`), so the coordinator records a real age for
+  corrupt repositories instead of nothing.
+
+### Changed
+- `Test-BackupHealth` gains an `IsFresh` field (recent backup present,
+  regardless of corruption). `IsHealthy` keeps its existing meaning — recent
+  backup **and** no corrupt files — so the coordinator decision matrix and all
+  HC verdicts are unaffected: corrupt repositories still fail hard.
+
 ## [2.2.4] - 2026-07-03
 
 ### Fixed
