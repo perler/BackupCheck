@@ -22,7 +22,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import zipfile
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from functools import wraps
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -530,7 +530,10 @@ def get_status():
     """Get coordinator status and recent activity, including version inventory."""
     db = get_db()
 
-    # Recent reports summary
+    # Recent reports summary. Cutoff must be isoformat like reported_at values:
+    # SQLite compares TEXT, and datetime('now') uses a space separator that
+    # sorts before the 'T' in stored timestamps, silently widening the window.
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
     recent = db.execute(
         """SELECT company_id, COUNT(*) as reports,
                   SUM(CASE WHEN verdict = 'success' THEN 1 ELSE 0 END) as success,
@@ -538,8 +541,9 @@ def get_status():
                   SUM(CASE WHEN verdict LIKE 'skip%' THEN 1 ELSE 0 END) as skipped,
                   MAX(reported_at) as last_report
            FROM reports
-           WHERE reported_at > datetime('now', '-24 hours')
-           GROUP BY company_id"""
+           WHERE reported_at > ?
+           GROUP BY company_id""",
+        (cutoff,),
     ).fetchall()
 
     # Per-company current version (latest report per company)
