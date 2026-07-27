@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Install BackupCheck on a Windows server, fully driven from this workstation.
 #
-# Usage: ./install-client.sh <CLIENT-CODE> <TARGET-HOST> [--ssh-user USER] [--dry-run]
+# Usage: ./install-client.sh <CLIENT-CODE> <TARGET-HOST> [--ssh-user USER] [--task-user USER] [--dry-run]
 #   ./install-client.sh PR 192.168.101.12
 #
 # Reads from BackupCheck/.env: HC_PING_KEY, HC_API_KEY, COORDINATOR_URL, COORDINATOR_API_KEY
@@ -18,18 +18,20 @@ CLIENT_CODE="${1:-}"
 TARGET_HOST="${2:-}"
 SSH_USER="admin"
 DRY_RUN=0
+TASK_USER_ARG=""
 
 while [[ $# -gt 2 ]]; do
   case "$3" in
-    --ssh-user)  SSH_USER="$4"; shift 2 ;;
-    --dry-run)   DRY_RUN=1; shift ;;
-    *)           echo "Unknown flag: $3" >&2; exit 2 ;;
+    --ssh-user)   SSH_USER="$4"; shift 2 ;;
+    --dry-run)    DRY_RUN=1; shift ;;
+    --task-user)  TASK_USER_ARG="$4"; shift 2 ;;
+    *)            echo "Unknown flag: $3" >&2; exit 2 ;;
   esac
 done
 
 if [[ -z "$CLIENT_CODE" || -z "$TARGET_HOST" ]]; then
   cat >&2 <<EOF
-Usage: $0 <CLIENT-CODE> <TARGET-HOST> [--ssh-user USER] [--dry-run]
+Usage: $0 <CLIENT-CODE> <TARGET-HOST> [--ssh-user USER] [--task-user USER] [--dry-run]
 Example: $0 PR 192.168.101.12
 EOF
   exit 2
@@ -44,30 +46,46 @@ cyan()  { printf '\033[36m%s\033[0m\n' "$*"; }
 fail()  { red "ERROR: $*"; exit 1; }
 
 # --- 1. Load workstation .env ---
+# The IT Portal lookups below run through tools/itportal, which reads ITPORTAL_API_KEY from
+# the environment. That key lives in the workstation-wide ~/.env, not in this repo's .env, so
+# without it the lookups fail with a bare 401 "Invalid API Key". Source it FIRST so the repo's
+# own .env still wins for anything both files define.
+if [[ -z "${ITPORTAL_API_KEY:-}" && -f "$HOME/.env" ]]; then
+  set -a; source "$HOME/.env"; set +a
+fi
 [[ -f "$REPO_ROOT/.env" ]] || fail "$REPO_ROOT/.env missing"
 set -a; source "$REPO_ROOT/.env"; set +a
 : "${HC_PING_KEY:?missing in .env}"
 : "${HC_API_KEY:?missing in .env}"
 : "${COORDINATOR_URL:?missing in .env}"
 : "${COORDINATOR_API_KEY:?missing in .env}"
+: "${ITPORTAL_API_KEY:?not in the environment and not in ~/.env — IT Portal lookups would 401}"
 
-# --- 2. SSH connectivity + auto-discover AD domain from target ---
+# --- 2. SSH connectivity + auto-discover AD domain / workgroup status from target ---
 cyan "Client: $CLIENT_CODE  Target: $SSH_USER@$TARGET_HOST"
 # PowerShell over SSH is finicky with embedded quotes — use Write-Output of plain vars,
-# read back as two separate lines.
+# read back as separate lines.
 PROBE_RAW=$(ssh -o ConnectTimeout=5 -o BatchMode=yes "$SSH_USER@$TARGET_HOST" \
-  'powershell -NoProfile -Command "Write-Output $env:COMPUTERNAME; Write-Output (Get-CimInstance Win32_ComputerSystem).Domain"' \
+  'powershell -NoProfile -Command "Write-Output $env:COMPUTERNAME; Write-Output (Get-CimInstance Win32_ComputerSystem).Domain; Write-Output (Get-CimInstance Win32_ComputerSystem).PartOfDomain"' \
   2>&1 | tr -d '\r') \
   || fail "Cannot reach $SSH_USER@$TARGET_HOST over SSH"
 TARGET_HOSTNAME=$(echo "$PROBE_RAW" | sed -n '1p')
 AD_DOMAIN=$(echo "$PROBE_RAW" | sed -n '2p')
-[[ -n "$AD_DOMAIN" && "$AD_DOMAIN" != "$TARGET_HOSTNAME" ]] || fail "Could not auto-detect AD domain from $TARGET_HOST (USERDNSDOMAIN empty — is this server domain-joined?)"
-AD_DOMAIN=$(echo "$AD_DOMAIN" | tr 'A-Z' 'a-z')
-# AD short name = first label (ad.pro-return.de → ad)
-AD_SHORT=$(echo "$AD_DOMAIN" | cut -d. -f1)
-green "  SSH OK ($TARGET_HOSTNAME, AD: $AD_DOMAIN)"
+PART_OF_DOMAIN=$(echo "$PROBE_RAW" | sed -n '3p')
 
-# --- 4a. AD\automat password lookup ---
+if [[ "$PART_OF_DOMAIN" == "True" ]]; then
+  [[ -n "$AD_DOMAIN" && "$AD_DOMAIN" != "$TARGET_HOSTNAME" ]] || fail "Could not auto-detect AD domain from $TARGET_HOST (USERDNSDOMAIN empty — is this server domain-joined?)"
+  AD_DOMAIN=$(echo "$AD_DOMAIN" | tr 'A-Z' 'a-z')
+  # AD short name = first label (ad.pro-return.de → ad)
+  AD_SHORT=$(echo "$AD_DOMAIN" | cut -d. -f1)
+  green "  SSH OK ($TARGET_HOSTNAME, AD: $AD_DOMAIN)"
+else
+  green "  SSH OK ($TARGET_HOSTNAME, WORKGROUP — local task account)"
+fi
+
+# --- 4a. Task account credential lookup ---
+if [[ "$PART_OF_DOMAIN" == "True" ]]; then
+# AD\automat password lookup
 # IT Portal has a first-class "Object Account" concept (type "AD Accounts") that is
 # *separate* from AdditionalCredentials. The automat user is one of these. To fetch:
 #   1. /Companies/?abbreviation=<CODE>  → resolve company.id
@@ -129,6 +147,125 @@ EOF
   esac
 }
 green "  AD\\automat password retrieved"
+TASK_USER="$AD_SHORT\\automat"
+TASK_PASS="$AUTOMAT_PASS"
+else
+# Local task account lookup (workgroup mode) — this host has no Active Directory, so the
+# scheduled task must run as a LOCAL account. Mirrors the NAS credential lookup pattern
+# below: resolve the client's company, find the Device matching this hostname, then pick
+# an AdditionalCredential attached to that Device.
+cyan "Looking up local task account credentials in IT Portal for $TARGET_HOSTNAME..."
+TASK_CREDS_JSON=$(cd "$ITPORTAL_DIR" && TARGET_HOSTNAME="$TARGET_HOSTNAME" CLIENT_CODE="$CLIENT_CODE" TASK_USER_ARG="$TASK_USER_ARG" node -e "
+const config = require('./config').load();
+const axios = require('axios');
+const code = process.env.CLIENT_CODE;
+const hostname = process.env.TARGET_HOSTNAME.toLowerCase();
+const taskUserArg = process.env.TASK_USER_ARG;
+const http = axios.create({ baseURL: config.baseURL, headers: { Authorization: config.apiKey } });
+(async () => {
+  const cR = await http.get('/Companies/', { params: { abbreviation: code } });
+  const company = cR.data.data.results[0];
+  if (!company) { console.error('NOT_FOUND'); process.exit(3); }
+  const AC = require('./itportal-additional-creds');
+  const ac = new AC();
+  const all = await ac._fetchAll();
+  const myDevices = new Map();
+  let cursor = null;
+  do {
+    const dR = await http.get('/Devices/', { params: { companyId: company.id, limit: 100, ...(cursor ? { cursor } : {}) } });
+    for (const d of dR.data.data.results) myDevices.set(d.id, d.name);
+    cursor = dR.data.data.nextCursor;
+  } while (cursor && myDevices.size < 1000);
+  const matchingDeviceIds = [...myDevices.entries()]
+    .filter(([id, name]) => (name || '').toLowerCase() === hostname || (name || '').toLowerCase().startsWith(hostname + '.'))
+    .map(([id]) => id);
+  if (matchingDeviceIds.length === 0) { console.error('NO_DEVICE:' + hostname); process.exit(3); }
+  const creds = all.filter(c =>
+    c.portalObject.itemType === 'Device' &&
+    matchingDeviceIds.includes(c.portalObject.id)
+  );
+  let pick;
+  if (taskUserArg) {
+    pick = creds.find(c => (c.username || '').toLowerCase() === taskUserArg.toLowerCase());
+    if (!pick) { console.error('NO_MATCH:' + taskUserArg); process.exit(3); }
+  } else {
+    pick = creds.find(c => (c.username || '').toLowerCase() === 'automat');
+    if (!pick) {
+      console.error(creds.length ? 'NO_AUTOMAT:' + creds.map(c => c.username).join(',') : 'NO_CREDS');
+      process.exit(3);
+    }
+  }
+  process.stdout.write(JSON.stringify({ user: pick.username, pass: pick.password }));
+})().catch(e => { console.error('ERR:' + (e.response?.data ? JSON.stringify(e.response.data) : e.message)); process.exit(5); });
+" 2>&1) || {
+  case "$TASK_CREDS_JSON" in
+    NOT_FOUND)
+      fail "Client $CLIENT_CODE not found in IT Portal." ;;
+    NO_DEVICE:*)
+      cat <<EOF >&2
+
+$(red "FAILURE: No IT Portal Device named '$TARGET_HOSTNAME' found for $CLIENT_CODE")
+
+This is a workgroup host (no Active Directory at this site), so the scheduled
+task needs a LOCAL account on $TARGET_HOSTNAME plus a matching IT Portal
+Device entry to look up its password:
+  1. Create a Device in IT Portal for $CLIENT_CODE named '$TARGET_HOSTNAME'.
+  2. Add an Additional Credential on that Device with the local account's
+     username and password (e.g. 'automat').
+  3. Re-run this command.
+EOF
+      exit 1 ;;
+    NO_MATCH:*)
+      fail "No credential with username '${TASK_CREDS_JSON#NO_MATCH:}' found on Device '$TARGET_HOSTNAME' in IT Portal." ;;
+    NO_CREDS)
+      cat <<EOF >&2
+
+$(red "FAILURE: No credentials recorded on Device '$TARGET_HOSTNAME' in IT Portal")
+
+This is a workgroup host, so the scheduled task must run as a LOCAL account on
+$TARGET_HOSTNAME (there is no Active Directory at this site), and its password
+has to come from IT Portal.
+
+To fix:
+  1. Create a local account on $TARGET_HOSTNAME (member of the local
+     Administrators group; rights to "Log on as a batch job").
+  2. Add an Additional Credential on the '$TARGET_HOSTNAME' Device in IT Portal
+     with that account's username and password. Name it 'automat' to have it
+     picked up automatically.
+  3. Re-run this command (add --task-user <username> if you named it otherwise).
+EOF
+      exit 1 ;;
+    NO_AUTOMAT:*)
+      cat <<EOF >&2
+
+$(red "FAILURE: No 'automat' credential found on Device '$TARGET_HOSTNAME'")
+
+This is a workgroup host, so the task account must be a LOCAL account on
+$TARGET_HOSTNAME (there is no Active Directory at this site). IT Portal has
+credential(s) on this Device (${TASK_CREDS_JSON#NO_AUTOMAT:}) but none is
+named 'automat', and this installer will not guess which one to use.
+
+To fix:
+  1. Create a local account on $TARGET_HOSTNAME (member of the local
+     Administrators group; rights to "Log on as a batch job").
+  2. Ensure IT Portal has an Additional Credential on the '$TARGET_HOSTNAME'
+     Device with that account's username and password.
+  3. Re-run with --task-user <username> to select it explicitly.
+EOF
+      exit 1 ;;
+    *)
+      fail "Task account lookup failed: $TASK_CREDS_JSON" ;;
+  esac
+}
+TASK_USER_NAME=$(echo "$TASK_CREDS_JSON" | python3 -c "import json,sys; print(json.load(sys.stdin)['user'])")
+TASK_USER_PASS=$(echo "$TASK_CREDS_JSON" | python3 -c "import json,sys; print(json.load(sys.stdin)['pass'])")
+green "  Local task account credentials retrieved: $TASK_USER_NAME"
+# Register-ScheduledTask -User will NOT accept the ".\user" form — it fails with
+# 0x80070534 "No mapping between account names and security IDs was done". Qualify the
+# local account with the machine name instead (machine names are never localised).
+TASK_USER="$TARGET_HOSTNAME\\$TASK_USER_NAME"
+TASK_PASS="$TASK_USER_PASS"
+fi
 
 # --- 4b. Detect Macrium repos (needed before NAS lookup so we know which NAS to authenticate) ---
 cyan "Detecting Macrium repositories on $TARGET_HOST..."
@@ -229,7 +366,19 @@ if [[ $DRY_RUN -eq 1 ]]; then
 fi
 
 # --- 6. Generate config + .env ---
-TMPDIR=$(mktemp -d); trap 'rm -rf "$TMPDIR"' EXIT
+TMPDIR=$(mktemp -d)
+STAGING_CREATED=0
+# The staged install-args.json holds the task account's PLAINTEXT password. If the remote
+# install fails part-way (it runs with $ErrorActionPreference="Stop"), the tidy-up further
+# down never executes and that file is left sitting on the client's disk — so clean it from
+# a trap instead of inline.
+cleanup() {
+  rm -rf "$TMPDIR"
+  if [[ "$STAGING_CREATED" == "1" ]]; then
+    ssh "$SSH_USER@$TARGET_HOST" 'powershell -NoProfile -Command "Remove-Item C:\BackupCheck-staging -Recurse -Force -EA SilentlyContinue"' >/dev/null 2>&1 || true
+  fi
+}
+trap cleanup EXIT
 python3 - "$TMPDIR/config.json" "$CLIENT_CODE" "${REPOS[@]}" <<'PYEOF'
 import json, sys
 out, code = sys.argv[1], sys.argv[2]
@@ -276,8 +425,8 @@ import json, sys
 json.dump({
     "ZipUrl": "$COORD_BASE/api/download/$ZIP_NAME",
     "CoordApiKey": "$COORDINATOR_API_KEY",
-    "TaskUser": "$AD_SHORT\\\\automat",
-    "TaskPassword": $(python3 -c "import json,sys; print(json.dumps(sys.argv[1]))" "$AUTOMAT_PASS"),
+    "TaskUser": $(python3 -c "import json,sys; print(json.dumps(sys.argv[1]))" "$TASK_USER"),
+    "TaskPassword": $(python3 -c "import json,sys; print(json.dumps(sys.argv[1]))" "$TASK_PASS"),
 }, open(sys.argv[1], "w"))
 PYEOF
 
@@ -330,11 +479,12 @@ REMOTEEOF
 # Stage files in C:\BackupCheck-staging\ (a fixed, predictable path that doesn't depend on
 # the actual SSH user's profile directory — admin.AD vs admin etc.)
 ssh "$SSH_USER@$TARGET_HOST" 'powershell -NoProfile -Command "New-Item -ItemType Directory -Path C:\BackupCheck-staging -Force | Out-Null"' >/dev/null
+STAGING_CREATED=1
 scp -q "$TMPDIR/config.json" "$TMPDIR/.env" "$TMPDIR/install-args.json" "$TMPDIR/run-install.ps1" \
     "$SSH_USER@$TARGET_HOST:C:/BackupCheck-staging/"
 
 ssh "$SSH_USER@$TARGET_HOST" "powershell -NoProfile -ExecutionPolicy Bypass -File C:/BackupCheck-staging/run-install.ps1"
-ssh "$SSH_USER@$TARGET_HOST" 'powershell -NoProfile -Command "Remove-Item C:\BackupCheck-staging -Recurse -Force -EA SilentlyContinue"'
+# staging (incl. the plaintext password) is removed by the EXIT trap, success or failure
 
 # --- 8. Wait briefly + verify on coordinator ---
 green "  Install complete. Waiting 15s for first run to report..."

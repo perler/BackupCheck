@@ -5,6 +5,39 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+Installer only (`install-client.sh`) — no change to `Monitor-Backups.ps1`, so no
+version bump and no new release zip.
+
+### Added
+- **Workgroup (non-domain-joined) targets are now supported.** The installer probed
+  `Win32_ComputerSystem.Domain` and demanded an AD `automat` account. On a workgroup
+  host that property returns `WORKGROUP`, which is not equal to the hostname, so the
+  existing guard *passed* and the run then died in the AD lookup telling the operator
+  to "create user automat in Active Directory" — impossible at a site with no AD.
+  It now reads `PartOfDomain` and branches: domain hosts keep the AD path untouched,
+  workgroup hosts resolve a **local** task account from an IT Portal Additional
+  Credential on the target host's own Device.
+- `--task-user USER` selects which credential to use when it is not named `automat`.
+  Without it the installer prefers `automat` and refuses to guess between others.
+
+### Fixed
+- **Scheduled task registration failed for local accounts.** `Register-ScheduledTask`
+  rejects the `.\user` form with `0x80070534` ("No mapping between account names and
+  security IDs was done"). Local task accounts are now qualified as `MACHINE\user`.
+- **The staged `install-args.json` — which holds the task account's plaintext
+  password — was left on the client when the remote install failed.** The remote
+  script runs with `$ErrorActionPreference="Stop"`, so a mid-way failure skipped the
+  inline tidy-up entirely. Staging is now removed from an `EXIT` trap, success or
+  failure.
+- **IT Portal lookups failed with a bare `401 Invalid API Key`** unless the caller
+  happened to have `ITPORTAL_API_KEY` exported already. The key lives in the
+  workstation-wide `~/.env`, not in the repo's `.env`; it is now sourced when absent,
+  before the repo `.env` so repo values still win.
+- Clearer failure output when the target's Device has *no* credentials at all, rather
+  than reporting an empty list of candidate usernames.
+
 ## [2.2.5] - 2026-07-21
 
 ### Fixed
