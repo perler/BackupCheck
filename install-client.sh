@@ -63,15 +63,29 @@ set -a; source "$REPO_ROOT/.env"; set +a
 
 # --- 2. SSH connectivity + auto-discover AD domain / workgroup status from target ---
 cyan "Client: $CLIENT_CODE  Target: $SSH_USER@$TARGET_HOST"
-# PowerShell over SSH is finicky with embedded quotes — use Write-Output of plain vars,
-# read back as separate lines.
+# PowerShell over SSH is finicky with embedded quotes — keep the remote command simple.
+# Each value is emitted as KEY=value and parsed BY KEY, never by line number: this probe
+# used to merge stderr into stdout and read lines 1/2/3, so on the first connection to a
+# host the "Warning: Permanently added ... to the list of known hosts." banner became
+# line 1 and shifted every value by one. A domain-joined server then read PartOfDomain as
+# the *domain name*, which is not "True", and was silently treated as a workgroup host.
+# stderr is therefore left on the terminal (where real errors belong) rather than captured.
 PROBE_RAW=$(ssh -o ConnectTimeout=5 -o BatchMode=yes "$SSH_USER@$TARGET_HOST" \
-  'powershell -NoProfile -Command "Write-Output $env:COMPUTERNAME; Write-Output (Get-CimInstance Win32_ComputerSystem).Domain; Write-Output (Get-CimInstance Win32_ComputerSystem).PartOfDomain"' \
-  2>&1 | tr -d '\r') \
+  'powershell -NoProfile -Command "$cs = Get-CimInstance Win32_ComputerSystem; Write-Output (\"HOSTNAME=\" + $env:COMPUTERNAME); Write-Output (\"DOMAIN=\" + $cs.Domain); Write-Output (\"PARTOFDOMAIN=\" + $cs.PartOfDomain)"' \
+  | tr -d '\r') \
   || fail "Cannot reach $SSH_USER@$TARGET_HOST over SSH"
-TARGET_HOSTNAME=$(echo "$PROBE_RAW" | sed -n '1p')
-AD_DOMAIN=$(echo "$PROBE_RAW" | sed -n '2p')
-PART_OF_DOMAIN=$(echo "$PROBE_RAW" | sed -n '3p')
+
+probe_val() { printf '%s\n' "$PROBE_RAW" | sed -n "s/^$1=//p" | tail -1; }
+TARGET_HOSTNAME=$(probe_val HOSTNAME)
+AD_DOMAIN=$(probe_val DOMAIN)
+PART_OF_DOMAIN=$(probe_val PARTOFDOMAIN)
+
+[[ -n "$TARGET_HOSTNAME" ]] || fail "Probe returned no HOSTNAME from $TARGET_HOST — got: $(printf '%s' "$PROBE_RAW" | head -3 | tr '\n' '|')"
+# Fail closed: never guess the account model from an unrecognised value.
+case "$PART_OF_DOMAIN" in
+  True|False) ;;
+  *) fail "Could not determine domain membership of $TARGET_HOST (PARTOFDOMAIN='$PART_OF_DOMAIN'). Refusing to guess between an AD and a local task account." ;;
+esac
 
 if [[ "$PART_OF_DOMAIN" == "True" ]]; then
   [[ -n "$AD_DOMAIN" && "$AD_DOMAIN" != "$TARGET_HOSTNAME" ]] || fail "Could not auto-detect AD domain from $TARGET_HOST (USERDNSDOMAIN empty — is this server domain-joined?)"
