@@ -7,8 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-Installer only (`install-client.sh`) — no change to `Monitor-Backups.ps1`, so no
-version bump and no new release zip.
+Installer (`install-client.sh`) and coordinator (`coordinator/app.py`, v2.2.6) — no
+change to `Monitor-Backups.ps1`, so no client version bump and no new release zip.
+The coordinator change needs a redeploy on orbit.
 
 ### Added
 - **Workgroup (non-domain-joined) targets are now supported.** The installer probed
@@ -23,6 +24,24 @@ version bump and no new release zip.
   Without it the installer prefers `automat` and refuses to guess between others.
 
 ### Fixed
+- **The coordinator created healthchecks.io checks and left them at HC's defaults.**
+  It provisions checks by pinging with `?create=1` but never called the management
+  API afterwards, so an auto-created check kept timeout 86400 (1 day), grace 3600
+  (1 hour) and no tags. The device-type profile (wks 4d/6h, nb 8d/6h, srv 1d/18h,
+  plus `backup macrium <code> <type>` tags) existed only client-side in
+  `Get-DeviceTypeSettings`, on the direct-ping path that stopped running for machine
+  checks when the coordinator took over pinging in v2.1. It went unnoticed because
+  every pre-existing check had been configured before that hand-over; NM was the
+  first client onboarded since, and `nm-wks001` came out as the only check in the
+  account at 86400/3600 with no tags. Left alone, every client onboarded from here
+  would get a 1-day period and 1-hour grace on workstation checks — exactly the
+  false-alarm pattern v2.2.4 was released to stop, firing at the weekend on a
+  workstation that legitimately goes a few days between images. The profile now
+  lives in `DEVICE_PROFILES` in the coordinator and is applied through the
+  management API on the first report that follows a check being created. The result
+  is cached per slug in a new `hc_check_config` table, so it costs one extra API
+  call per check per lifetime, not one per report. Machines whose name matches no
+  known device type are left untouched.
 - **Scheduled task registration failed for local accounts.** `Register-ScheduledTask`
   rejects the `.\user` form with `0x80070534` ("No mapping between account names and
   security IDs was done"). Local task accounts are now qualified as `MACHINE\user`.
