@@ -1,16 +1,25 @@
 #!/usr/bin/env bash
 # Install BackupCheck on a Windows server, fully driven from this workstation.
 #
-# Usage: ./install-client.sh <CLIENT-CODE> <TARGET-HOST> [--ssh-user USER] [--task-user USER] [--dry-run]
+# Usage: ./install-client.sh <CLIENT-CODE> <TARGET-HOST> [--ssh-user USER] [--task-user USER]
+#            [--repo <path>[=<machine>] ...] [--dry-run]
 #   ./install-client.sh PR 192.168.101.12
+#   ./install-client.sh RAH 157.90.91.117 --repo 'D:\srv001=SRV001' --repo '\\nas003\backup=SRV001-offsite'
 #
 # Reads from BackupCheck/.env: HC_PING_KEY, HC_API_KEY, COORDINATOR_URL, COORDINATOR_API_KEY
 # Looks up via IT Portal:
 #   - AD\automat password (object Account, type AD, username automat) — fails if missing.
-#   - NAS share user/password (backup or backupadmin on the client's NAS device).
+#   - NAS share user/password (backup or backupadmin on the client's NAS device), only when
+#     at least one repository is a UNC path.
 #
 # Detects Macrium repos via mrserver.exe over SSH, writes config + .env on target,
 # downloads release zip from coordinator, registers BackupMonitor scheduled task.
+#
+# --repo is repeatable and bypasses mrserver.exe detection entirely (no SSH probe for it) —
+# use it for destinations mrserver.exe can't see (standalone Reflect, no Site Manager) or to
+# name a flat repository's machine explicitly (<path>=<machine>: the directory itself is the
+# machine, no per-machine subdirectory is enumerated). A spec with no "=machine" behaves like
+# an auto-detected repository (each subdirectory enumerated as a machine).
 
 set -euo pipefail
 
@@ -19,19 +28,21 @@ TARGET_HOST="${2:-}"
 SSH_USER="admin"
 DRY_RUN=0
 TASK_USER_ARG=""
+REPO_SPECS=()
 
 while [[ $# -gt 2 ]]; do
   case "$3" in
     --ssh-user)   SSH_USER="$4"; shift 2 ;;
     --dry-run)    DRY_RUN=1; shift ;;
     --task-user)  TASK_USER_ARG="$4"; shift 2 ;;
+    --repo)       REPO_SPECS+=("$4"); shift 2 ;;
     *)            echo "Unknown flag: $3" >&2; exit 2 ;;
   esac
 done
 
 if [[ -z "$CLIENT_CODE" || -z "$TARGET_HOST" ]]; then
   cat >&2 <<EOF
-Usage: $0 <CLIENT-CODE> <TARGET-HOST> [--ssh-user USER] [--task-user USER] [--dry-run]
+Usage: $0 <CLIENT-CODE> <TARGET-HOST> [--ssh-user USER] [--task-user USER] [--repo <path>[=<machine>] ...] [--dry-run]
 Example: $0 PR 192.168.101.12
 EOF
   exit 2
@@ -281,10 +292,14 @@ TASK_USER="$TARGET_HOSTNAME\\$TASK_USER_NAME"
 TASK_PASS="$TASK_USER_PASS"
 fi
 
-# --- 4b. Detect Macrium repos (needed before NAS lookup so we know which NAS to authenticate) ---
-cyan "Detecting Macrium repositories on $TARGET_HOST..."
-REPOS_CSV=$(ssh "$SSH_USER@$TARGET_HOST" 'powershell -NoProfile -Command "& \"C:\Program Files\Macrium\SiteManager\mrserver.exe\" --action get-repo-status --outputtoconsole 2>$null"' || true)
-REPOS_RAW=$(printf '%s' "$REPOS_CSV" | python3 -c "
+# --- 4b. Determine Macrium repos (needed before NAS lookup so we know which NAS to authenticate) ---
+if [[ ${#REPO_SPECS[@]} -gt 0 ]]; then
+  cyan "Using ${#REPO_SPECS[@]} repository(ies) from --repo (skipping mrserver.exe detection)..."
+  REPOS=("${REPO_SPECS[@]}")
+else
+  cyan "Detecting Macrium repositories on $TARGET_HOST..."
+  REPOS_CSV=$(ssh "$SSH_USER@$TARGET_HOST" 'powershell -NoProfile -Command "& \"C:\Program Files\Macrium\SiteManager\mrserver.exe\" --action get-repo-status --outputtoconsole 2>$null"' || true)
+  REPOS_RAW=$(printf '%s' "$REPOS_CSV" | python3 -c "
 import sys, csv, io
 text = sys.stdin.read().replace('\r', '')
 reader = csv.reader(io.StringIO(text))
@@ -298,20 +313,40 @@ for r in rows[1:]:
     if len(r) > idx and r[idx]:
         print(r[idx])
 ")
-REPOS=()
-while IFS= read -r line; do
-    [[ -n "$line" ]] && REPOS+=("$line")
-done <<< "$REPOS_RAW"
-[[ ${#REPOS[@]} -gt 0 ]] || fail "No Macrium repositories detected. Is Macrium Site Manager installed and configured?"
-
-NAS_SERVERS=$(printf '%s\n' "${REPOS[@]}" | sed -E 's@^\\\\([^\\]+)\\.*@\1@' | sort -u)
-NAS_SERVER_COUNT=$(echo "$NAS_SERVERS" | wc -l)
-[[ "$NAS_SERVER_COUNT" -eq 1 ]] || fail "Repositories span multiple NAS servers — this installer expects one: $NAS_SERVERS"
-NAS_HOSTNAME=$(echo "$NAS_SERVERS" | head -1)
-green "  Found ${#REPOS[@]} repository(ies) on \\\\${NAS_HOSTNAME}:"
+  REPOS=()
+  while IFS= read -r line; do
+      [[ -n "$line" ]] && REPOS+=("$line")
+  done <<< "$REPOS_RAW"
+  [[ ${#REPOS[@]} -gt 0 ]] || fail "No Macrium repositories detected. Is Macrium Site Manager installed and configured?"
+fi
+green "  Using ${#REPOS[@]} repository(ies):"
 for r in "${REPOS[@]}"; do echo "    - $r"; done
 
-# --- 4c. NAS credential lookup ---
+# NAS hostname is derived from UNC repositories only. A local path (e.g.
+# D:\srv001) has no NAS server — it used to survive this sed unchanged and
+# count as a second "NAS server", tripping the "spans multiple NAS servers"
+# abort even on a single-NAS site.
+UNC_PATHS=()
+for r in "${REPOS[@]}"; do
+  repo_path="${r%%=*}"
+  case "$repo_path" in
+    '\\'*) UNC_PATHS+=("$repo_path") ;;
+  esac
+done
+
+if [[ ${#UNC_PATHS[@]} -eq 0 ]]; then
+  NAS_HOSTNAME=""
+  cyan "  No UNC repositories — skipping NAS credential lookup."
+else
+  NAS_SERVERS=$(printf '%s\n' "${UNC_PATHS[@]}" | sed -E 's@^\\\\([^\\]+)\\.*@\1@' | sort -u)
+  NAS_SERVER_COUNT=$(echo "$NAS_SERVERS" | wc -l)
+  [[ "$NAS_SERVER_COUNT" -eq 1 ]] || fail "Repositories span multiple NAS servers — this installer expects one: $NAS_SERVERS"
+  NAS_HOSTNAME=$(echo "$NAS_SERVERS" | head -1)
+  green "  NAS server: \\\\${NAS_HOSTNAME}"
+fi
+
+# --- 4c. NAS credential lookup (only when a UNC repository needs one) ---
+if [[ -n "$NAS_HOSTNAME" ]]; then
 # Resolve via the IT Portal REST API directly (same pattern as automat above):
 #   /Companies/?abbreviation=<CODE>           → company.id
 #   /Devices/?company=<id>                    → list this client's devices
@@ -343,11 +378,21 @@ const http = axios.create({ baseURL: config.baseURL, headers: { Authorization: c
     for (const d of dR.data.data.results) myDevices.set(d.id, d.name);
     cursor = dR.data.data.nextCursor;
   } while (cursor && myDevices.size < 1000);
-  const matchingDeviceIds = [...myDevices.entries()]
-    .filter(([id, name]) => (name || '').toLowerCase() === nasHost || (name || '').toLowerCase().startsWith(nasHost + '.'))
-    .map(([id]) => id);
+  // The name in the UNC path and the name in IT Portal need not agree on
+  // qualification: a repository may be reached as \\\\nas003.ad.example.de\\backup
+  // while the Device is recorded as plain 'NAS003', or the other way round.
+  // Try the name as given first, then its first DNS label.
+  const nasShort = nasHost.split('.')[0];
+  const candidates = nasHost === nasShort ? [nasHost] : [nasHost, nasShort];
+  let matchingDeviceIds = [];
+  for (const want of candidates) {
+    matchingDeviceIds = [...myDevices.entries()]
+      .filter(([id, name]) => (name || '').toLowerCase() === want || (name || '').toLowerCase().startsWith(want + '.'))
+      .map(([id]) => id);
+    if (matchingDeviceIds.length > 0) break;
+  }
   if (matchingDeviceIds.length === 0) {
-    console.error('NO_DEVICE:' + nasHost);
+    console.error('NO_DEVICE:' + candidates.join('/'));
     process.exit(3);
   }
   const mine = all.filter(c =>
@@ -373,6 +418,11 @@ NAS_USER=$(echo "$NAS_CREDS_JSON" | python3 -c "import json,sys; print(json.load
 NAS_PASS=$(echo "$NAS_CREDS_JSON" | python3 -c "import json,sys; print(json.load(sys.stdin)['pass'])")
 NAS_DEVICE=$(echo "$NAS_CREDS_JSON" | python3 -c "import json,sys; print(json.load(sys.stdin)['device'])")
 green "  NAS credentials: $NAS_DEVICE\\$NAS_USER"
+else
+NAS_USER=""
+NAS_PASS=""
+NAS_DEVICE=""
+fi
 
 if [[ $DRY_RUN -eq 1 ]]; then
   cyan "[dry-run] Would now write config + .env, install task. Stopping."
@@ -396,7 +446,18 @@ trap cleanup EXIT
 python3 - "$TMPDIR/config.json" "$CLIENT_CODE" "${REPOS[@]}" <<'PYEOF'
 import json, sys
 out, code = sys.argv[1], sys.argv[2]
-repos = sys.argv[3:]
+specs = sys.argv[3:]
+# A spec is "<path>" (plain string, enumerating repository — today's
+# behaviour) or "<path>=<machine>" (object form, flat repository naming its
+# own machine). Split on the FIRST "=" only, so a machine name can't itself
+# contain one without breaking the path.
+repos = []
+for spec in specs:
+    if "=" in spec:
+        path, machine = spec.split("=", 1)
+        repos.append({"path": path, "machine": machine})
+    else:
+        repos.append(spec)
 config = {
   "configVersion": 2,
   "companyId": code,
@@ -413,14 +474,18 @@ config = {
 with open(out, "w") as f: json.dump(config, f, indent=2)
 PYEOF
 
-cat > "$TMPDIR/.env" <<EOF
-HC_PING_KEY=$HC_PING_KEY
-HC_API_KEY=$HC_API_KEY
-REPO_USERNAME=$NAS_DEVICE\\$NAS_USER
-REPO_PASSWORD=$NAS_PASS
-COORDINATOR_URL=$COORDINATOR_URL
-COORDINATOR_API_KEY=$COORDINATOR_API_KEY
-EOF
+{
+  echo "HC_PING_KEY=$HC_PING_KEY"
+  echo "HC_API_KEY=$HC_API_KEY"
+  # Omitted entirely when there is no UNC repository (NAS_HOSTNAME empty) —
+  # a monitor with only local repositories needs no share credentials.
+  if [[ -n "$NAS_HOSTNAME" ]]; then
+    echo "REPO_USERNAME=$NAS_DEVICE\\$NAS_USER"
+    echo "REPO_PASSWORD=$NAS_PASS"
+  fi
+  echo "COORDINATOR_URL=$COORDINATOR_URL"
+  echo "COORDINATOR_API_KEY=$COORDINATOR_API_KEY"
+} > "$TMPDIR/.env"
 
 # --- 7. Push setup script + run it on target ---
 cyan "Setting up C:\\BackupCheck on $TARGET_HOST..."

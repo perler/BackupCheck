@@ -57,6 +57,50 @@ The coordinator change needs a redeploy on orbit.
 - Clearer failure output when the target's Device has *no* credentials at all, rather
   than reporting an empty list of candidate usernames.
 
+## [2.3.0] - 2026-08-11
+
+### Added
+- **Flat repositories can now name their own machine.** A `config.json` repository entry may
+  be an object `{ "path": ..., "machine": ... }` instead of a plain string: the directory
+  itself IS the machine (named by `machine`), with no subdirectory enumeration. Some Macrium
+  destinations write `.mrimg` files directly into the destination folder with no per-machine
+  subdirectory, so there is no directory name to take a machine name from. `Get-BackupRepositories`
+  normalises every entry to `{ Path; Machine }` so nothing downstream has to ask "is this a
+  string?" — Machine is `$null` for plain strings and auto-detected repositories, unchanged.
+  `Test-BackupHealth` gained an optional `-MachineName` that overrides `Split-Path -Leaf` when set.
+- **`install-client.sh --repo <path>[=<machine>]`** (repeatable) supplies repositories directly
+  and skips `mrserver.exe` detection entirely — for standalone Macrium Reflect installs with no
+  Site Manager, or to name a flat repository's machine explicitly. Emits the object form in the
+  generated `config.json` for specs carrying a machine name, a plain string otherwise.
+
+### Fixed
+- **Local repository paths no longer count as an extra NAS server.** The NAS hostname was
+  derived by stripping `\\server\` off every repository path; a local path like `D:\srv001`
+  survived the regex unchanged and counted as a second "NAS server", aborting the installer with
+  "spans multiple NAS servers" even at a single-NAS site. The derivation now considers UNC
+  repositories only. With zero UNC repositories the NAS credential lookup is skipped entirely and
+  no `REPO_USERNAME`/`REPO_PASSWORD` are written to the generated `.env`.
+- **Local repository paths no longer produce a spurious red "Failed" line at monitor startup.**
+  The share-connect loop tried (and failed) to `net use` non-UNC paths; it now skips any path
+  that isn't `\\...` before attempting a connection.
+- **Share-connect dedupe bug.** The loop tested the *full* repository path against a hashtable
+  keyed by the `\\server` prefix, so it never matched and `net use /delete` + reconnect ran once
+  per repository instead of once per server sharing that repository. It now keys the lookup the
+  same way it's populated.
+- **One unreachable repository no longer aborts the entire scan.** On a UNC path the account
+  cannot read, `Test-Path` *raises* "Access is denied" instead of returning `$false`, and the
+  script-wide `$ErrorActionPreference = "Stop"` turned that into a fatal error — the run died
+  before Phase 2, so every other machine, healthy ones included, silently stopped reporting.
+  The unreachable repository is now logged and skipped, as was always intended.
+- **Single-repository clients could have broken on upgrade.** `return @(...)` unrolls a
+  one-element array back to the bare element, so a client with exactly one configured repository
+  would have received a raw hashtable instead of an array of one, and `foreach` would have
+  iterated its *keys*. Harmless while repositories were bare strings; fixed with `return ,@(...)`
+  before it could bite.
+- **IT Portal NAS device lookup now tolerates FQDN/short-name mismatch.** A repository reached as
+  `\\nas003.ad.example.de\backup` failed to match a Device recorded as plain `NAS003`. The lookup
+  tries the name as given, then its first DNS label.
+
 ## [2.2.5] - 2026-07-21
 
 ### Fixed
