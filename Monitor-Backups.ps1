@@ -9,9 +9,12 @@
 
     v2.0 adds: self-updating, HC API caching, structured logging, meta-monitoring.
     v2.1 adds: coordinator API integration with direct-ping fallback.
+    v2.3 adds: flat repositories that name their own machine, for Macrium
+    destinations that write backup files directly into the destination with
+    no per-machine subdirectory to take a name from.
 
 .NOTES
-    Version: 2.2.0
+    Version: 2.3.0
     Requires: PowerShell 5.1+
 #>
 
@@ -33,7 +36,7 @@ $ErrorActionPreference = "Stop"
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
 # Script version
-$script:Version = "2.2.5"
+$script:Version = "2.4.0"
 
 # Track connections we've made for cleanup
 $script:MountedShares = @()
@@ -242,7 +245,13 @@ function Get-BackupRepositories {
 
                 if ($repositories.Count -gt 0) {
                     Write-Log "Auto-detected $($repositories.Count) repositories"
-                    return $repositories
+                    # Auto-detected repos never carry a configured machine name —
+                    # each subdirectory is enumerated as before. The leading comma
+                    # is load-bearing: without it, PowerShell unrolls a single-
+                    # element array back to the bare hashtable when there is
+                    # exactly one repository, so the caller silently gets a
+                    # Hashtable instead of an array of one.
+                    return ,@($repositories | ForEach-Object { @{ Path = $_; Machine = $null } })
                 }
             }
             catch {
@@ -251,9 +260,24 @@ function Get-BackupRepositories {
         }
     }
 
-    # Fall back to configured repositories
+    # Fall back to configured repositories. Normalise every entry to one
+    # shape (Path/Machine) so nothing downstream has to ask "is this a
+    # string?" — a plain string is an enumerating repository (Machine =
+    # $null, today's behaviour unchanged); an object with a `path` property
+    # (ConvertFrom-Json yields a PSCustomObject here, never a string) is a
+    # flat repository naming its own machine. The leading comma before @()
+    # is load-bearing (see the auto-detect branch above): most clients run
+    # with exactly one configured repository, and without it PowerShell
+    # unrolls that single-element array back to a bare hashtable.
     if ($Config.repositories -and $Config.repositories.Count -gt 0) {
-        return $Config.repositories
+        return ,@($Config.repositories | ForEach-Object {
+            if ($_.PSObject.Properties.Name -contains "path") {
+                @{ Path = $_.path; Machine = $_.machine }
+            }
+            else {
+                @{ Path = $_; Machine = $null }
+            }
+        })
     }
 
     throw "No repositories configured or detected"
@@ -294,12 +318,15 @@ function Test-BackupHealth {
         [bool]$SkipIfRunning = $true,
 
         [Parameter()]
-        [string]$RunningFilePattern = "backup_running*"
+        [string]$RunningFilePattern = "backup_running*",
+
+        [Parameter()]
+        [string]$MachineName
     )
 
     $result = @{
         Path = $Path
-        MachineName = Split-Path $Path -Leaf
+        MachineName = if ($MachineName) { $MachineName } else { Split-Path $Path -Leaf }
         IsHealthy = $false
         IsFresh = $false
         IsSkipped = $false
@@ -309,6 +336,7 @@ function Test-BackupHealth {
         BackupCount = 0
         HasErrorFiles = $false
         ErrorFileCount = 0
+        IsWarning = $false
     }
 
     # Check if backup is currently running
@@ -321,8 +349,13 @@ function Test-BackupHealth {
         }
     }
 
-    # Check for error files (.mrimg.error_loading) - these indicate corruption
-    $errorFiles = Get-ChildItem -Path $Path -Filter "*.error_loading" -Recurse -File -ErrorAction SilentlyContinue
+    # Check for error files (.mrimg.error_loading) - these indicate corruption.
+    # Macrium appends a numeric suffix when the target name is already taken
+    # (.error_loading1, .error_loading2, ...). The plain "*.error_loading" filter
+    # missed those, so the alert undercounted: STPH WKS011 reported 6 corrupted
+    # files on 2026-08-20 when 11 were on disk. Filter wide, then match exactly.
+    $errorFiles = @(Get-ChildItem -Path $Path -Filter "*.error_loading*" -Recurse -File -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -match '\.error_loading\d*$' })
     if ($errorFiles) {
         $result.HasErrorFiles = $true
         $result.ErrorFileCount = ($errorFiles | Measure-Object).Count
@@ -333,7 +366,7 @@ function Test-BackupHealth {
     $backupFiles = Get-ChildItem -Path $Path -Filter $FilePattern -Recurse -File -ErrorAction SilentlyContinue |
         Where-Object {
             $_.LastWriteTime -gt $cutoffTime -and
-            $_.Name -notmatch '\.(error_loading|tmp)$'
+            $_.Name -notmatch '\.(error_loading\d*|tmp)$'
         }
 
     $result.BackupCount = ($backupFiles | Measure-Object).Count
@@ -346,9 +379,18 @@ function Test-BackupHealth {
     }
 
     # Freshness is evaluated independently of corruption so that a repository
-    # with .error_loading files cannot mask a stopped backup. Healthy still
-    # requires both conditions, so a corrupt repo continues to fail.
-    $result.IsHealthy = ($result.IsFresh -and -not $result.HasErrorFiles)
+    # with .error_loading files cannot mask a stopped backup.
+    #
+    # Corruption on its own no longer fails the check. A .error_loading file sits
+    # on disk until somebody deletes it by hand, so a machine that was backing up
+    # perfectly went DOWN and stayed DOWN: STPH WKS011 mailed a DOWN alert every
+    # day from 13. to 20.08.2026 while its image chain was unbroken and current,
+    # and the alert text ("corrupted backup file(s) detected") read as an active
+    # backup failure. Corrupt-but-fresh is now a warning - the check stays UP and
+    # the ping body carries the WARNING line so the cleanup is still visible.
+    # Corrupt AND stale is the case this detection exists for, and still fails.
+    $result.IsHealthy = $result.IsFresh
+    $result.IsWarning = ($result.IsFresh -and $result.HasErrorFiles)
 
     return $result
 }
@@ -870,7 +912,10 @@ Write-Log "Tags: $($tags -join ', ')"
 # Get repositories
 $repositories = Get-BackupRepositories -Config $config
 Write-Log "Monitoring $($repositories.Count) repository(ies):"
-$repositories | ForEach-Object { Write-Log "  - $_" }
+$repositories | ForEach-Object {
+    if ($_.Machine) { Write-Log "  - $($_.Path) (machine: $($_.Machine))" }
+    else { Write-Log "  - $($_.Path)" }
+}
 
 # Load HC API configuration cache
 $configCache = Get-ConfigCache
@@ -884,17 +929,32 @@ if ($repoUsername -and $repoPassword) {
     Write-Log "Connecting to repositories with stored credentials..."
     $uniqueServers = @{}
     foreach ($repo in $repositories) {
-        if (-not $uniqueServers.ContainsKey($repo)) {
-            $connected = Connect-ShareWithCredentials -SharePath $repo -Username $repoUsername -Password $repoPassword
+        $repoPath = $repo.Path
+
+        # Local (non-UNC) paths need no credentials — connecting is meaningless
+        # and previously produced a spurious red "Failed: D:\srv001" line.
+        # This also captures the \\server prefix in one step, so it doubles
+        # as the UNC test below.
+        if ($repoPath -notmatch '^(\\\\[^\\]+)') {
+            continue
+        }
+
+        # Bug fix: this used to dedupe on the FULL repository path against a
+        # hashtable keyed by the \\server prefix (set two lines below), so it
+        # never matched and `net use /delete` + reconnect ran once per
+        # repository sharing a server instead of once per server. Key the
+        # lookup the same way it's populated.
+        $serverPrefix = $Matches[1]
+
+        if (-not $uniqueServers.ContainsKey($serverPrefix)) {
+            $connected = Connect-ShareWithCredentials -SharePath $repoPath -Username $repoUsername -Password $repoPassword
             if ($connected) {
-                Write-Log "  Connected: $repo" -Level OK -Color Green
+                Write-Log "  Connected: $repoPath" -Level OK -Color Green
             }
             else {
-                Write-Log "  Failed: $repo" -Level FAIL -Color Red
+                Write-Log "  Failed: $repoPath" -Level FAIL -Color Red
             }
-            if ($repo -match '^(\\\\[^\\]+)') {
-                $uniqueServers[$Matches[1]] = $true
-            }
+            $uniqueServers[$serverPrefix] = $true
         }
     }
 }
@@ -903,25 +963,43 @@ if ($repoUsername -and $repoPassword) {
 $results = @()
 $successCount = 0
 $failCount = 0
+$warnCount = 0
 $skipCount = 0
 
 foreach ($repo in $repositories) {
-    Write-Log "Scanning: $repo" -Color Yellow
+    Write-Log "Scanning: $($repo.Path)" -Color Yellow
 
-    if (-not (Test-Path $repo)) {
-        Write-Log "Repository not accessible: $repo" -Level WARN -Color Yellow
+    # -ErrorAction SilentlyContinue is load-bearing: on an unreadable UNC path
+    # Test-Path RAISES "Access is denied" rather than returning $false, and the
+    # script-wide $ErrorActionPreference = "Stop" turned that into a fatal error.
+    # One unreachable repository then aborted the whole run before Phase 2, so
+    # every OTHER machine — healthy ones included — silently stopped reporting.
+    if (-not (Test-Path $repo.Path -ErrorAction SilentlyContinue)) {
+        Write-Log "Repository not accessible: $($repo.Path)" -Level WARN -Color Yellow
         continue
     }
 
-    # Get machine directories
-    $machineDirs = Get-ChildItem -Path $repo -Directory -ErrorAction SilentlyContinue
+    # Build the list of machines to check for this repository, then run ONE
+    # loop over that list below with the (unchanged) per-machine body — a
+    # named (flat) repository IS one machine, since some Macrium destinations
+    # write .mrimg files directly into the destination with no per-machine
+    # subdirectory to enumerate or take a name from. An unnamed repository
+    # keeps today's behaviour: each subdirectory is a machine.
+    if ($repo.Machine) {
+        $machines = @(@{ Path = $repo.Path; Name = $repo.Machine })
+    }
+    else {
+        $machines = @(Get-ChildItem -Path $repo.Path -Directory -ErrorAction SilentlyContinue |
+            ForEach-Object { @{ Path = $_.FullName; Name = $null } })
+    }
 
-    foreach ($machineDir in $machineDirs) {
-        $health = Test-BackupHealth -Path $machineDir.FullName `
+    foreach ($machine in $machines) {
+        $health = Test-BackupHealth -Path $machine.Path `
             -MaxAgeHours $config.backupMaxAgeHours `
             -FilePattern $config.backupFilePattern `
             -SkipIfRunning $config.skipIfRunning `
-            -RunningFilePattern $config.runningFilePattern
+            -RunningFilePattern $config.runningFilePattern `
+            -MachineName $machine.Name
 
         $slug = Get-CheckSlug -CompanyId $config.companyId -MachineName $health.MachineName
 
@@ -942,16 +1020,26 @@ foreach ($repo in $repositories) {
             "No backups found within last $($config.backupMaxAgeHours) hours"
         }
 
-        $statusDetail = if ($health.HasErrorFiles) {
+        $statusDetail = if ($health.IsWarning) {
+            "WARNING: $($health.ErrorFileCount) corrupted backup file(s) left on disk (.error_loading) - delete them; backups themselves are current: $freshDetail"
+        }
+        elseif ($health.HasErrorFiles) {
             "ERROR: $($health.ErrorFileCount) corrupted backup file(s) detected (.error_loading); $freshDetail"
         }
         else {
             $freshDetail
         }
 
-        if ($health.HasErrorFiles) {
+        if ($health.HasErrorFiles -and -not $health.IsFresh) {
+            # Corrupt AND nothing fresh - the case the corruption check exists
+            # for. Fails for every device type; the stale-workstation tolerance
+            # below deliberately does not apply here.
             Write-Log "  [ERR]  $($health.MachineName): $statusDetail" -Level FAIL -Color Magenta
             $failCount++
+        }
+        elseif ($health.IsWarning) {
+            Write-Log "  [WARN] $($health.MachineName): $statusDetail" -Level WARN -Color Yellow
+            $warnCount++
         }
         elseif ($health.IsFresh) {
             Write-Log "  [OK]   $($health.MachineName): $statusDetail" -Level OK -Color Green
@@ -1036,12 +1124,13 @@ Write-Log ""
 Write-Log "Summary" -Color Cyan
 Write-Log "-------" -Color Cyan
 Write-Log "  Healthy:  $successCount" -Level OK -Color Green
+Write-Log "  Warnings: $warnCount" -Level $(if ($warnCount -gt 0) { "WARN" } else { "INFO" }) -Color $(if ($warnCount -gt 0) { "Yellow" } else { "Gray" })
 Write-Log "  Failed:   $failCount" -Level $(if ($failCount -gt 0) { "FAIL" } else { "INFO" }) -Color $(if ($failCount -gt 0) { "Red" } else { "Gray" })
 Write-Log "  Skipped:  $skipCount" -Level INFO
 
 # Meta-monitoring: ping a health check for the monitor itself
 $metaSlug = "$($config.companyId)-monitor-health".ToLower()
-$metaMessage = "[BackupCheck v$($script:Version)] Completed: $successCount ok, $failCount fail, $skipCount skip"
+$metaMessage = "[BackupCheck v$($script:Version)] Completed: $successCount ok, $warnCount warn, $failCount fail, $skipCount skip"
 try {
     $metaEndpoint = "$($config.healthchecksBaseUrl)/$pingKey/$metaSlug`?create=1"
     Invoke-WebRequest -Uri $metaEndpoint -Method POST -Body $metaMessage -ContentType "text/plain" -UseBasicParsing | Out-Null

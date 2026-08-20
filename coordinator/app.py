@@ -42,13 +42,25 @@ ATERA_API_KEY = os.environ.get("ATERA_API_KEY", "")
 API_KEYS = [k.strip() for k in os.environ.get("COORDINATOR_API_KEYS", "").split(",") if k.strip()]
 ADMIN_KEY = os.environ.get("COORDINATOR_ADMIN_KEY", "")
 ATERA_CACHE_SECONDS = int(os.environ.get("ATERA_CACHE_SECONDS", "900"))  # 15 min
-COORDINATOR_VERSION = "2.2.3"
+COORDINATOR_VERSION = "2.2.6"
 
 # Online-hour thresholds for notebooks/workstations: how many hourly reports
 # we must see (since the last successful backup) before flipping a missing
 # backup from "warming up" (paused) to "fail". Servers fail immediately.
 ONLINE_HOUR_THRESHOLDS = {"nb": 48, "wks": 36}
 VALID_CHANNELS = ("stable", "canary")
+
+# Per-device-type check settings, mirroring Get-DeviceTypeSettings in
+# Monitor-Backups.ps1. Checks we auto-create with ?create=1 keep healthchecks.io
+# defaults (timeout 86400, grace 3600, no tags) until the management API is
+# called, which is far too tight for a workstation that legitimately goes days
+# between images.
+DEVICE_PROFILES = {
+    "wks": {"timeout": 345600, "grace": 21600},  # 4 days / 6 hours
+    "nb": {"timeout": 691200, "grace": 21600},   # 8 days / 6 hours
+    "srv": {"timeout": 86400, "grace": 64800},   # 1 day / 18 hours
+}
+HC_BASE_TAGS = ("backup", "macrium")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -99,6 +111,14 @@ def init_db():
             slug TEXT PRIMARY KEY,
             uuid TEXT NOT NULL,
             cached_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS hc_check_config (
+            slug TEXT PRIMARY KEY,
+            tags TEXT NOT NULL,
+            timeout INTEGER NOT NULL,
+            grace INTEGER NOT NULL,
+            configured_at TEXT NOT NULL
         );
 
         CREATE TABLE IF NOT EXISTS atera_cache (
@@ -389,6 +409,65 @@ def pause_hc(db, slug):
         return False
 
 
+def hc_desired_config(company_id, name):
+    """Desired HC settings for a machine, or None if the device type is unknown."""
+    prefix = _device_prefix(name)
+    profile = DEVICE_PROFILES.get(prefix)
+    if not profile:
+        return None
+    return {
+        "tags": " ".join(HC_BASE_TAGS + (company_id, prefix)),
+        "timeout": profile["timeout"],
+        "grace": profile["grace"],
+    }
+
+
+def ensure_hc_config(db, slug, company_id, name):
+    """Apply the device-type profile to a check, via the HC management API.
+
+    Checks the coordinator auto-creates by pinging with ?create=1 keep HC's
+    defaults (1 day timeout / 1 hour grace, no tags), so a workstation that
+    legitimately goes a few days between images flips DOWN at the weekend.
+    No-op once the profile is applied — the result is cached per slug.
+    """
+    desired = hc_desired_config(company_id, name)
+    if not desired or not HC_API_KEY:
+        return False
+
+    row = db.execute(
+        "SELECT tags, timeout, grace FROM hc_check_config WHERE slug = ?", (slug,)
+    ).fetchone()
+    if row and (row["tags"], row["timeout"], row["grace"]) == (
+        desired["tags"], desired["timeout"], desired["grace"]
+    ):
+        return False
+
+    uuid = get_hc_uuid(db, slug)
+    if not uuid:
+        # Check doesn't exist yet (no ping has created it) — retry next report.
+        return False
+
+    try:
+        _hc_api_request(
+            f"https://healthchecks.io/api/v3/checks/{uuid}", method="POST", data=desired
+        )
+    except Exception as e:
+        log.error(f"HC config update failed for {slug}: {e}")
+        return False
+
+    db.execute(
+        """INSERT OR REPLACE INTO hc_check_config
+           (slug, tags, timeout, grace, configured_at) VALUES (?, ?, ?, ?, ?)""",
+        (slug, desired["tags"], desired["timeout"], desired["grace"],
+         datetime.now(timezone.utc).isoformat()),
+    )
+    log.info(
+        f"{slug}: applied {_device_prefix(name)} profile (timeout="
+        f"{desired['timeout']}, grace={desired['grace']}, tags='{desired['tags']}')"
+    )
+    return True
+
+
 # --- API Routes ---
 
 @app.route("/api/report", methods=["POST"])
@@ -489,6 +568,11 @@ def receive_report():
                 f"{slug}: skipping ping - agent offline, backup missing"
                 + (" (paused)" if paused else "")
             )
+
+        # A ping with ?create=1 provisions the check at HC's defaults, so the
+        # device-type profile has to be applied afterwards. No-op if the check
+        # doesn't exist yet (no ping sent) or is already configured.
+        ensure_hc_config(db, slug, company_id, name)
 
         # Update report with verdict
         db.execute(

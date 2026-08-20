@@ -1,7 +1,8 @@
 {
   "companyId": "ACME",
   "repositories": [
-    "\\\\server\\backup_share"
+    "\\\\server\\backup_share",
+    { "path": "D:\\srv001", "machine": "SRV001" }
   ],
   "backupMaxAgeHours": 24,
   "backupFilePattern": "*.mrimg",

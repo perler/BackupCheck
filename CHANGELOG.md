@@ -5,6 +5,127 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+Client `Monitor-Backups.ps1` is bumped to **v2.4.0**, so this needs a new release zip
+before it reaches any client. Also carries an installer (`install-client.sh`) and
+coordinator (`coordinator/app.py`, v2.2.6) change; the coordinator change needs a
+redeploy on orbit.
+
+### Changed
+- **Corrupt backup files no longer fail a check on their own — corrupt *and* stale
+  still does.** A `.error_loading` file stays on disk until a human deletes it, and
+  the verdict was `IsFresh -and -not HasErrorFiles`, so one corrupt leftover pinned a
+  check DOWN indefinitely no matter how well the machine was backing up. STPH WKS011
+  mailed a DOWN alert every day from 13. to 20.08.2026 with an unbroken, current image
+  chain behind it — eleven leftovers from two corruption waves in July and August that
+  Macrium had already recovered from on its own (new full 10.08., clean increments
+  since). Worse than the noise: the alert body read `ERROR: 6 corrupted backup file(s)
+  detected`, which is indistinguishable from a backup that is actually failing, and it
+  sent an operator looking for a client to notify about a backup that was fine.
+  Corrupt-but-fresh is now a **warning** — the check stays UP, the ping body leads with
+  `WARNING: N corrupted backup file(s) left on disk (.error_loading) - delete them`, and
+  the summary counts warnings separately. Corrupt with nothing fresh is the case this
+  detection exists for and still fails, for every device type: the stale-workstation
+  tolerance added in v2.2.4 deliberately does not apply to it.
+
+### Added
+- **Workgroup (non-domain-joined) targets are now supported.** The installer probed
+  `Win32_ComputerSystem.Domain` and demanded an AD `automat` account. On a workgroup
+  host that property returns `WORKGROUP`, which is not equal to the hostname, so the
+  existing guard *passed* and the run then died in the AD lookup telling the operator
+  to "create user automat in Active Directory" — impossible at a site with no AD.
+  It now reads `PartOfDomain` and branches: domain hosts keep the AD path untouched,
+  workgroup hosts resolve a **local** task account from an IT Portal Additional
+  Credential on the target host's own Device.
+- `--task-user USER` selects which credential to use when it is not named `automat`.
+  Without it the installer prefers `automat` and refuses to guess between others.
+
+### Fixed
+- **Corrupted files with a collision suffix were not counted.** Macrium appends a
+  number when the target name is taken, producing `.error_loading1`, `.error_loading2`
+  and so on, but detection filtered on `*.error_loading` and the freshness scan
+  excluded only `\.(error_loading|tmp)$`. On STPH WKS011 that reported 6 corrupted
+  files when 11 were on disk — and the five it missed were the *newer* wave, so the
+  count understated the problem in exactly the direction that matters. Both the filter
+  and the exclusion regex now match `.error_loading` followed by optional digits.
+- **The coordinator created healthchecks.io checks and left them at HC's defaults.**
+  It provisions checks by pinging with `?create=1` but never called the management
+  API afterwards, so an auto-created check kept timeout 86400 (1 day), grace 3600
+  (1 hour) and no tags. The device-type profile (wks 4d/6h, nb 8d/6h, srv 1d/18h,
+  plus `backup macrium <code> <type>` tags) existed only client-side in
+  `Get-DeviceTypeSettings`, on the direct-ping path that stopped running for machine
+  checks when the coordinator took over pinging in v2.1. It went unnoticed because
+  every pre-existing check had been configured before that hand-over; NM was the
+  first client onboarded since, and `nm-wks001` came out as the only check in the
+  account at 86400/3600 with no tags. Left alone, every client onboarded from here
+  would get a 1-day period and 1-hour grace on workstation checks — exactly the
+  false-alarm pattern v2.2.4 was released to stop, firing at the weekend on a
+  workstation that legitimately goes a few days between images. The profile now
+  lives in `DEVICE_PROFILES` in the coordinator and is applied through the
+  management API on the first report that follows a check being created. The result
+  is cached per slug in a new `hc_check_config` table, so it costs one extra API
+  call per check per lifetime, not one per report. Machines whose name matches no
+  known device type are left untouched.
+- **Scheduled task registration failed for local accounts.** `Register-ScheduledTask`
+  rejects the `.\user` form with `0x80070534` ("No mapping between account names and
+  security IDs was done"). Local task accounts are now qualified as `MACHINE\user`.
+- **The staged `install-args.json` — which holds the task account's plaintext
+  password — was left on the client when the remote install failed.** The remote
+  script runs with `$ErrorActionPreference="Stop"`, so a mid-way failure skipped the
+  inline tidy-up entirely. Staging is now removed from an `EXIT` trap, success or
+  failure.
+- **IT Portal lookups failed with a bare `401 Invalid API Key`** unless the caller
+  happened to have `ITPORTAL_API_KEY` exported already. The key lives in the
+  workstation-wide `~/.env`, not in the repo's `.env`; it is now sourced when absent,
+  before the repo `.env` so repo values still win.
+- Clearer failure output when the target's Device has *no* credentials at all, rather
+  than reporting an empty list of candidate usernames.
+
+## [2.3.0] - 2026-08-11
+
+### Added
+- **Flat repositories can now name their own machine.** A `config.json` repository entry may
+  be an object `{ "path": ..., "machine": ... }` instead of a plain string: the directory
+  itself IS the machine (named by `machine`), with no subdirectory enumeration. Some Macrium
+  destinations write `.mrimg` files directly into the destination folder with no per-machine
+  subdirectory, so there is no directory name to take a machine name from. `Get-BackupRepositories`
+  normalises every entry to `{ Path; Machine }` so nothing downstream has to ask "is this a
+  string?" — Machine is `$null` for plain strings and auto-detected repositories, unchanged.
+  `Test-BackupHealth` gained an optional `-MachineName` that overrides `Split-Path -Leaf` when set.
+- **`install-client.sh --repo <path>[=<machine>]`** (repeatable) supplies repositories directly
+  and skips `mrserver.exe` detection entirely — for standalone Macrium Reflect installs with no
+  Site Manager, or to name a flat repository's machine explicitly. Emits the object form in the
+  generated `config.json` for specs carrying a machine name, a plain string otherwise.
+
+### Fixed
+- **Local repository paths no longer count as an extra NAS server.** The NAS hostname was
+  derived by stripping `\\server\` off every repository path; a local path like `D:\srv001`
+  survived the regex unchanged and counted as a second "NAS server", aborting the installer with
+  "spans multiple NAS servers" even at a single-NAS site. The derivation now considers UNC
+  repositories only. With zero UNC repositories the NAS credential lookup is skipped entirely and
+  no `REPO_USERNAME`/`REPO_PASSWORD` are written to the generated `.env`.
+- **Local repository paths no longer produce a spurious red "Failed" line at monitor startup.**
+  The share-connect loop tried (and failed) to `net use` non-UNC paths; it now skips any path
+  that isn't `\\...` before attempting a connection.
+- **Share-connect dedupe bug.** The loop tested the *full* repository path against a hashtable
+  keyed by the `\\server` prefix, so it never matched and `net use /delete` + reconnect ran once
+  per repository instead of once per server sharing that repository. It now keys the lookup the
+  same way it's populated.
+- **One unreachable repository no longer aborts the entire scan.** On a UNC path the account
+  cannot read, `Test-Path` *raises* "Access is denied" instead of returning `$false`, and the
+  script-wide `$ErrorActionPreference = "Stop"` turned that into a fatal error — the run died
+  before Phase 2, so every other machine, healthy ones included, silently stopped reporting.
+  The unreachable repository is now logged and skipped, as was always intended.
+- **Single-repository clients could have broken on upgrade.** `return @(...)` unrolls a
+  one-element array back to the bare element, so a client with exactly one configured repository
+  would have received a raw hashtable instead of an array of one, and `foreach` would have
+  iterated its *keys*. Harmless while repositories were bare strings; fixed with `return ,@(...)`
+  before it could bite.
+- **IT Portal NAS device lookup now tolerates FQDN/short-name mismatch.** A repository reached as
+  `\\nas003.ad.example.de\backup` failed to match a Device recorded as plain `NAS003`. The lookup
+  tries the name as given, then its first DNS label.
+
 ## [2.2.5] - 2026-07-21
 
 ### Fixed
