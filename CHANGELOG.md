@@ -7,9 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-Installer (`install-client.sh`) and coordinator (`coordinator/app.py`, v2.2.6) — no
-change to `Monitor-Backups.ps1`, so no client version bump and no new release zip.
-The coordinator change needs a redeploy on orbit.
+Client `Monitor-Backups.ps1` is bumped to **v2.4.0**, so this needs a new release zip
+before it reaches any client. Also carries an installer (`install-client.sh`) and
+coordinator (`coordinator/app.py`, v2.2.6) change; the coordinator change needs a
+redeploy on orbit.
+
+### Changed
+- **Corrupt backup files no longer fail a check on their own — corrupt *and* stale
+  still does.** A `.error_loading` file stays on disk until a human deletes it, and
+  the verdict was `IsFresh -and -not HasErrorFiles`, so one corrupt leftover pinned a
+  check DOWN indefinitely no matter how well the machine was backing up. STPH WKS011
+  mailed a DOWN alert every day from 13. to 20.08.2026 with an unbroken, current image
+  chain behind it — eleven leftovers from two corruption waves in July and August that
+  Macrium had already recovered from on its own (new full 10.08., clean increments
+  since). Worse than the noise: the alert body read `ERROR: 6 corrupted backup file(s)
+  detected`, which is indistinguishable from a backup that is actually failing, and it
+  sent an operator looking for a client to notify about a backup that was fine.
+  Corrupt-but-fresh is now a **warning** — the check stays UP, the ping body leads with
+  `WARNING: N corrupted backup file(s) left on disk (.error_loading) - delete them`, and
+  the summary counts warnings separately. Corrupt with nothing fresh is the case this
+  detection exists for and still fails, for every device type: the stale-workstation
+  tolerance added in v2.2.4 deliberately does not apply to it.
 
 ### Added
 - **Workgroup (non-domain-joined) targets are now supported.** The installer probed
@@ -24,6 +42,13 @@ The coordinator change needs a redeploy on orbit.
   Without it the installer prefers `automat` and refuses to guess between others.
 
 ### Fixed
+- **Corrupted files with a collision suffix were not counted.** Macrium appends a
+  number when the target name is taken, producing `.error_loading1`, `.error_loading2`
+  and so on, but detection filtered on `*.error_loading` and the freshness scan
+  excluded only `\.(error_loading|tmp)$`. On STPH WKS011 that reported 6 corrupted
+  files when 11 were on disk — and the five it missed were the *newer* wave, so the
+  count understated the problem in exactly the direction that matters. Both the filter
+  and the exclusion regex now match `.error_loading` followed by optional digits.
 - **The coordinator created healthchecks.io checks and left them at HC's defaults.**
   It provisions checks by pinging with `?create=1` but never called the management
   API afterwards, so an auto-created check kept timeout 86400 (1 day), grace 3600

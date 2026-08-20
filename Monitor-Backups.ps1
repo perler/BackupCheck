@@ -36,7 +36,7 @@ $ErrorActionPreference = "Stop"
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
 # Script version
-$script:Version = "2.3.0"
+$script:Version = "2.4.0"
 
 # Track connections we've made for cleanup
 $script:MountedShares = @()
@@ -336,6 +336,7 @@ function Test-BackupHealth {
         BackupCount = 0
         HasErrorFiles = $false
         ErrorFileCount = 0
+        IsWarning = $false
     }
 
     # Check if backup is currently running
@@ -348,8 +349,13 @@ function Test-BackupHealth {
         }
     }
 
-    # Check for error files (.mrimg.error_loading) - these indicate corruption
-    $errorFiles = Get-ChildItem -Path $Path -Filter "*.error_loading" -Recurse -File -ErrorAction SilentlyContinue
+    # Check for error files (.mrimg.error_loading) - these indicate corruption.
+    # Macrium appends a numeric suffix when the target name is already taken
+    # (.error_loading1, .error_loading2, ...). The plain "*.error_loading" filter
+    # missed those, so the alert undercounted: STPH WKS011 reported 6 corrupted
+    # files on 2026-08-20 when 11 were on disk. Filter wide, then match exactly.
+    $errorFiles = @(Get-ChildItem -Path $Path -Filter "*.error_loading*" -Recurse -File -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -match '\.error_loading\d*$' })
     if ($errorFiles) {
         $result.HasErrorFiles = $true
         $result.ErrorFileCount = ($errorFiles | Measure-Object).Count
@@ -360,7 +366,7 @@ function Test-BackupHealth {
     $backupFiles = Get-ChildItem -Path $Path -Filter $FilePattern -Recurse -File -ErrorAction SilentlyContinue |
         Where-Object {
             $_.LastWriteTime -gt $cutoffTime -and
-            $_.Name -notmatch '\.(error_loading|tmp)$'
+            $_.Name -notmatch '\.(error_loading\d*|tmp)$'
         }
 
     $result.BackupCount = ($backupFiles | Measure-Object).Count
@@ -373,9 +379,18 @@ function Test-BackupHealth {
     }
 
     # Freshness is evaluated independently of corruption so that a repository
-    # with .error_loading files cannot mask a stopped backup. Healthy still
-    # requires both conditions, so a corrupt repo continues to fail.
-    $result.IsHealthy = ($result.IsFresh -and -not $result.HasErrorFiles)
+    # with .error_loading files cannot mask a stopped backup.
+    #
+    # Corruption on its own no longer fails the check. A .error_loading file sits
+    # on disk until somebody deletes it by hand, so a machine that was backing up
+    # perfectly went DOWN and stayed DOWN: STPH WKS011 mailed a DOWN alert every
+    # day from 13. to 20.08.2026 while its image chain was unbroken and current,
+    # and the alert text ("corrupted backup file(s) detected") read as an active
+    # backup failure. Corrupt-but-fresh is now a warning - the check stays UP and
+    # the ping body carries the WARNING line so the cleanup is still visible.
+    # Corrupt AND stale is the case this detection exists for, and still fails.
+    $result.IsHealthy = $result.IsFresh
+    $result.IsWarning = ($result.IsFresh -and $result.HasErrorFiles)
 
     return $result
 }
@@ -948,6 +963,7 @@ if ($repoUsername -and $repoPassword) {
 $results = @()
 $successCount = 0
 $failCount = 0
+$warnCount = 0
 $skipCount = 0
 
 foreach ($repo in $repositories) {
@@ -1004,16 +1020,26 @@ foreach ($repo in $repositories) {
             "No backups found within last $($config.backupMaxAgeHours) hours"
         }
 
-        $statusDetail = if ($health.HasErrorFiles) {
+        $statusDetail = if ($health.IsWarning) {
+            "WARNING: $($health.ErrorFileCount) corrupted backup file(s) left on disk (.error_loading) - delete them; backups themselves are current: $freshDetail"
+        }
+        elseif ($health.HasErrorFiles) {
             "ERROR: $($health.ErrorFileCount) corrupted backup file(s) detected (.error_loading); $freshDetail"
         }
         else {
             $freshDetail
         }
 
-        if ($health.HasErrorFiles) {
+        if ($health.HasErrorFiles -and -not $health.IsFresh) {
+            # Corrupt AND nothing fresh - the case the corruption check exists
+            # for. Fails for every device type; the stale-workstation tolerance
+            # below deliberately does not apply here.
             Write-Log "  [ERR]  $($health.MachineName): $statusDetail" -Level FAIL -Color Magenta
             $failCount++
+        }
+        elseif ($health.IsWarning) {
+            Write-Log "  [WARN] $($health.MachineName): $statusDetail" -Level WARN -Color Yellow
+            $warnCount++
         }
         elseif ($health.IsFresh) {
             Write-Log "  [OK]   $($health.MachineName): $statusDetail" -Level OK -Color Green
@@ -1098,12 +1124,13 @@ Write-Log ""
 Write-Log "Summary" -Color Cyan
 Write-Log "-------" -Color Cyan
 Write-Log "  Healthy:  $successCount" -Level OK -Color Green
+Write-Log "  Warnings: $warnCount" -Level $(if ($warnCount -gt 0) { "WARN" } else { "INFO" }) -Color $(if ($warnCount -gt 0) { "Yellow" } else { "Gray" })
 Write-Log "  Failed:   $failCount" -Level $(if ($failCount -gt 0) { "FAIL" } else { "INFO" }) -Color $(if ($failCount -gt 0) { "Red" } else { "Gray" })
 Write-Log "  Skipped:  $skipCount" -Level INFO
 
 # Meta-monitoring: ping a health check for the monitor itself
 $metaSlug = "$($config.companyId)-monitor-health".ToLower()
-$metaMessage = "[BackupCheck v$($script:Version)] Completed: $successCount ok, $failCount fail, $skipCount skip"
+$metaMessage = "[BackupCheck v$($script:Version)] Completed: $successCount ok, $warnCount warn, $failCount fail, $skipCount skip"
 try {
     $metaEndpoint = "$($config.healthchecksBaseUrl)/$pingKey/$metaSlug`?create=1"
     Invoke-WebRequest -Uri $metaEndpoint -Method POST -Body $metaMessage -ContentType "text/plain" -UseBasicParsing | Out-Null
