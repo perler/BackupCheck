@@ -5,12 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [2.4.0] - 2026-08-20
 
-Client `Monitor-Backups.ps1` is bumped to **v2.4.0**, so this needs a new release zip
-before it reaches any client. Also carries an installer (`install-client.sh`) and
-coordinator (`coordinator/app.py`, v2.2.6) change; the coordinator change needs a
-redeploy on orbit.
+Client `Monitor-Backups.ps1` v2.4.0, published to the `stable` channel on 2026-08-20.
+All seven clients were on 2.3.0/stable at publish time and pick it up on their next
+update check; that check is throttled to once per 24 h, so the rollout completes within
+a day rather than immediately. STPH was used as the release check — it self-updated and
+ran clean on Windows PowerShell 5.1 at 16:54 CEST, reporting five machines healthy.
+Also carries the installer (`install-client.sh`) and coordinator (`coordinator/app.py`,
+v2.2.6) changes below; orbit was already running coordinator 2.2.6, so no redeploy was
+needed despite the earlier note to the contrary.
 
 ### Changed
 - **Corrupt backup files no longer fail a check on their own — corrupt *and* stale
