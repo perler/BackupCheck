@@ -12,9 +12,13 @@
     v2.3 adds: flat repositories that name their own machine, for Macrium
     destinations that write backup files directly into the destination with
     no per-machine subdirectory to take a name from.
+    v2.5 adds: air-gap media (USB Copy targets) are walked and every machine's
+    newest image chain is asserted restorable (a -00-00 base exists and every
+    member carries the Macrium end-of-file marker); a run in which no
+    configured repository is reachable no longer reports the monitor healthy.
 
 .NOTES
-    Version: 2.3.0
+    Version: 2.5.0
     Requires: PowerShell 5.1+
 #>
 
@@ -36,7 +40,13 @@ $ErrorActionPreference = "Stop"
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
 # Script version
-$script:Version = "2.4.0"
+$script:Version = "2.5.0"
+
+# A Macrium .mrimg that was written to completion carries this ASCII marker
+# inside its last 64 bytes; a truncated copy does not. Proven on RAHR's USB
+# media 2026-08-16 (28/28 files of a known-good chain carry it, three copies
+# that died mid-write do not). One 64-byte read per file, whatever its size.
+$script:MacriumEndMarker = "__79241006_2651_11D4_"
 
 # Track connections we've made for cleanup
 $script:MountedShares = @()
@@ -391,6 +401,129 @@ function Test-BackupHealth {
     # Corrupt AND stale is the case this detection exists for, and still fails.
     $result.IsHealthy = $result.IsFresh
     $result.IsWarning = ($result.IsFresh -and $result.HasErrorFiles)
+
+    return $result
+}
+
+function Test-MacriumEndMarker {
+    <#
+    .SYNOPSIS
+        Returns $true if the file's last 64 bytes contain the Macrium end-of-file
+        marker, i.e. the image was written to completion.
+    #>
+    param(
+        [Parameter(Mandatory)]
+        [string]$Path
+    )
+
+    $stream = $null
+    try {
+        $stream = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite)
+        if ($stream.Length -lt 64) { return $false }
+        $null = $stream.Seek(-64, [IO.SeekOrigin]::End)
+        $buffer = New-Object byte[] 64
+        $read = $stream.Read($buffer, 0, 64)
+        $tail = [Text.Encoding]::ASCII.GetString($buffer, 0, $read)
+        return $tail.Contains($script:MacriumEndMarker)
+    }
+    catch {
+        # Unreadable counts as unfinished: a copy we cannot read the end of is
+        # not one we can call restorable.
+        return $false
+    }
+    finally {
+        if ($stream) { $stream.Dispose() }
+    }
+}
+
+function Test-AirGapChain {
+    <#
+    .SYNOPSIS
+        Asserts that a machine's newest image chain on an air-gap medium is
+        restorable: a -00-00 base exists AND every member carries the end marker.
+    .DESCRIPTION
+        Chain members are files named <16-hex-id>-NN-NN.mrimg. Files with any
+        other name (USB Copy "_Conflict" artefacts, .tmp fragments) are not
+        visible to Macrium, so they are counted but never satisfy the assertion.
+        The newest chain is the one holding the most recently written member.
+        A member without the marker that was written within the last hour is
+        treated as a copy still in progress, not as a failure.
+    #>
+    param(
+        [Parameter(Mandatory)]
+        [string]$Path,
+
+        [Parameter(Mandatory)]
+        [string]$MachineName
+    )
+
+    $result = @{
+        MachineName = $MachineName
+        Path = $Path
+        Status = "FAIL"        # OK | FAIL | BUSY
+        Detail = ""
+        ChainId = $null
+        FileCount = 0
+        OrphanCount = 0
+    }
+
+    $allFiles = @(Get-ChildItem -Path $Path -Filter "*.mrimg*" -Recurse -File -ErrorAction SilentlyContinue)
+    $chains = @{}
+    foreach ($f in $allFiles) {
+        if ($f.Name -match '^([0-9A-Fa-f]{16})-\d{2}-\d{2}\.mrimg$') {
+            $id = $Matches[1].ToUpper()
+            if (-not $chains.ContainsKey($id)) { $chains[$id] = @() }
+            $chains[$id] += $f
+        }
+        else {
+            $result.OrphanCount++
+        }
+    }
+
+    if ($chains.Count -eq 0) {
+        $result.Detail = "no image chain on medium ($($allFiles.Count) file(s), none named as a chain member)"
+        return $result
+    }
+
+    # Newest chain = the one whose most recent member was written last.
+    $newestId = $null
+    $newestTime = [datetime]::MinValue
+    foreach ($id in $chains.Keys) {
+        $t = ($chains[$id] | Sort-Object LastWriteTime -Descending | Select-Object -First 1).LastWriteTime
+        if ($t -gt $newestTime) { $newestTime = $t; $newestId = $id }
+    }
+    $members = @($chains[$newestId] | Sort-Object Name)
+    $result.ChainId = $newestId
+    $result.FileCount = $members.Count
+    $newestStamp = $newestTime.ToString("yyyy-MM-dd HH:mm")
+
+    $hasBase = @($members | Where-Object { $_.Name -match '-00-00\.mrimg$' }).Count -gt 0
+
+    $unfinished = @()
+    $busy = @()
+    $inProgressCutoff = (Get-Date).AddHours(-1)
+    foreach ($m in $members) {
+        if (-not (Test-MacriumEndMarker -Path $m.FullName)) {
+            if ($m.LastWriteTime -gt $inProgressCutoff) { $busy += $m.Name } else { $unfinished += $m.Name }
+        }
+    }
+
+    $orphanNote = if ($result.OrphanCount -gt 0) { "; $($result.OrphanCount) file(s) outside any chain (conflict/tmp artefacts)" } else { "" }
+
+    if (-not $hasBase) {
+        $result.Detail = "newest chain $newestId has NO -00-00 base ($($members.Count) file(s), newest $newestStamp)$orphanNote"
+    }
+    elseif ($unfinished.Count -gt 0) {
+        $result.Detail = "chain $newestId`: $($unfinished.Count) of $($members.Count) file(s) unfinished (no end marker): $($unfinished -join ', ')$orphanNote"
+    }
+    elseif ($busy.Count -gt 0) {
+        $result.Status = "BUSY"
+        $result.Detail = "chain $newestId`: copy in progress ($($busy -join ', ') written within the last hour)$orphanNote"
+    }
+    else {
+        $result.Status = "OK"
+        $result.Detail = "chain $newestId`: base + $($members.Count - 1) file(s), $($members.Count)/$($members.Count) complete, newest $newestStamp$orphanNote"
+    }
 
     return $result
 }
@@ -917,6 +1050,17 @@ $repositories | ForEach-Object {
     else { Write-Log "  - $($_.Path)" }
 }
 
+# Air-gap media (USB Copy targets). Each entry is the ROOT of a medium; the
+# copy job mirrors the source share into it, so machines sit one level down:
+# <root>\<share-copy>\<MACHINE>\...\*.mrimg. Optional - absent means no
+# air-gap check, exactly today's behaviour.
+$airGapRoots = @()
+if ($config.airGapRepositories -and $config.airGapRepositories.Count -gt 0) {
+    $airGapRoots = @($config.airGapRepositories | ForEach-Object { [string]$_ })
+    Write-Log "Air-gap media ($($airGapRoots.Count)):"
+    $airGapRoots | ForEach-Object { Write-Log "  - $_" }
+}
+
 # Load HC API configuration cache
 $configCache = Get-ConfigCache
 
@@ -928,8 +1072,8 @@ try {
 if ($repoUsername -and $repoPassword) {
     Write-Log "Connecting to repositories with stored credentials..."
     $uniqueServers = @{}
-    foreach ($repo in $repositories) {
-        $repoPath = $repo.Path
+    $connectPaths = @($repositories | ForEach-Object { $_.Path }) + $airGapRoots
+    foreach ($repoPath in $connectPaths) {
 
         # Local (non-UNC) paths need no credentials — connecting is meaningless
         # and previously produced a spurious red "Failed: D:\srv001" line.
@@ -965,6 +1109,7 @@ $successCount = 0
 $failCount = 0
 $warnCount = 0
 $skipCount = 0
+$reachableRepoCount = 0
 
 foreach ($repo in $repositories) {
     Write-Log "Scanning: $($repo.Path)" -Color Yellow
@@ -978,6 +1123,7 @@ foreach ($repo in $repositories) {
         Write-Log "Repository not accessible: $($repo.Path)" -Level WARN -Color Yellow
         continue
     }
+    $reachableRepoCount++
 
     # Build the list of machines to check for this repository, then run ONE
     # loop over that list below with the (unchanged) per-machine body — a
@@ -1079,6 +1225,41 @@ foreach ($repo in $repositories) {
     }
 }
 
+# Phase 1b: Air-gap media. Not freshness - restorability. The failure this
+# exists for (RAHR, Feb-Aug 2026) was a medium that looked current by file
+# dates while the newest chain had no base image and its copies had died
+# mid-write, so nothing on it could be restored. A failed assertion is a
+# FAIL for that machine, never a skip.
+$airGapResults = @()
+$airGapReachable = 0
+foreach ($root in $airGapRoots) {
+    Write-Log "Scanning air-gap medium: $root" -Color Yellow
+    if (-not (Test-Path $root -ErrorAction SilentlyContinue)) {
+        Write-Log "Air-gap medium not accessible: $root" -Level WARN -Color Yellow
+        continue
+    }
+    $airGapReachable++
+
+    # System/housekeeping folders a NAS puts on removable media are not
+    # share copies (#recycle, @eaDir, $RECYCLE.BIN, System Volume Information).
+    $shareCopies = @(Get-ChildItem -Path $root -Directory -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -notmatch '^[#@$]' -and $_.Name -ne 'System Volume Information' })
+    foreach ($shareCopy in $shareCopies) {
+        $machineDirs = @(Get-ChildItem -Path $shareCopy.FullName -Directory -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -notmatch '^[#@$]' })
+        foreach ($machineDir in $machineDirs) {
+            $chain = Test-AirGapChain -Path $machineDir.FullName -MachineName $machineDir.Name
+            $chain.Medium = "$root\$($shareCopy.Name)"
+            switch ($chain.Status) {
+                "OK"   { Write-Log "  [OK]   $($chain.MachineName): $($chain.Detail)" -Level OK -Color Green }
+                "BUSY" { Write-Log "  [SKIP] $($chain.MachineName): $($chain.Detail)" -Level SKIP -Color DarkGray }
+                default { Write-Log "  [FAIL] $($chain.MachineName): $($chain.Detail)" -Level FAIL -Color Red }
+            }
+            $airGapResults += $chain
+        }
+    }
+}
+
 # Phase 2: Report results - coordinator or direct HC pings
 $useDirectPing = $true
 
@@ -1119,6 +1300,52 @@ if ($useDirectPing) {
     Save-ConfigCache -Cache $configCache
 }
 
+# Phase 3: Air-gap verdict -> ONE check, "{companyId}-usb-copy", pinged
+# directly (the coordinator's Atera-online logic is about machines, not
+# media). Every machine's line is in the ping body. No medium reachable ->
+# no ping at all, so the check goes late instead of lying either way.
+$airGapOk = 0
+$airGapFail = 0
+$airGapBusy = 0
+if ($airGapRoots.Count -gt 0) {
+    $airGapOk = @($airGapResults | Where-Object { $_.Status -eq "OK" }).Count
+    $airGapFail = @($airGapResults | Where-Object { $_.Status -eq "FAIL" }).Count
+    $airGapBusy = @($airGapResults | Where-Object { $_.Status -eq "BUSY" }).Count
+    $airGapSlug = Get-CheckSlug -CompanyId $config.companyId -MachineName "usb-copy"
+
+    if ($airGapReachable -eq 0) {
+        Write-Log "No air-gap medium reachable - not pinging $airGapSlug (check will go late)" -Level WARN -Color Yellow
+    }
+    else {
+        $airGapSuccess = ($airGapFail -eq 0 -and $airGapResults.Count -gt 0)
+        $airGapHeader = "[BackupCheck v$($script:Version)] Air-gap media: $airGapReachable of $($airGapRoots.Count) reachable, $($airGapResults.Count) machine(s): $airGapOk ok, $airGapFail fail, $airGapBusy in progress"
+        if ($airGapResults.Count -eq 0) {
+            $airGapHeader += " - FAIL: no image chain on any reachable medium"
+        }
+        $airGapLines = @($airGapResults | Sort-Object { $_.Status }, { $_.MachineName } | ForEach-Object {
+            "$($_.Status.PadRight(4)) $($_.MachineName): $($_.Detail) [$($_.Medium)]"
+        })
+        $airGapMessage = (@($airGapHeader) + $airGapLines) -join "`n"
+
+        $pingResult = Send-HealthCheck -BaseUrl $config.healthchecksBaseUrl `
+            -PingKey $pingKey `
+            -Slug $airGapSlug `
+            -Success $airGapSuccess `
+            -Message $airGapMessage `
+            -Tags ($tags + "usbcopy") `
+            -ApiKey $apiKey `
+            -MachineName "usb-copy" `
+            -ConfigCache $configCache
+        if ($pingResult.Success) {
+            Write-Log "Air-gap ping sent ($airGapSlug, $(if ($airGapSuccess) { 'success' } else { 'FAIL' }))" -Level $(if ($airGapSuccess) { "OK" } else { "FAIL" }) -Color $(if ($airGapSuccess) { "Green" } else { "Red" })
+        }
+        else {
+            Write-Log "Failed to send air-gap ping ($airGapSlug): $($pingResult.Error)" -Level WARN -Color Yellow
+        }
+        Save-ConfigCache -Cache $configCache
+    }
+}
+
 # Summary
 Write-Log ""
 Write-Log "Summary" -Color Cyan
@@ -1127,14 +1354,33 @@ Write-Log "  Healthy:  $successCount" -Level OK -Color Green
 Write-Log "  Warnings: $warnCount" -Level $(if ($warnCount -gt 0) { "WARN" } else { "INFO" }) -Color $(if ($warnCount -gt 0) { "Yellow" } else { "Gray" })
 Write-Log "  Failed:   $failCount" -Level $(if ($failCount -gt 0) { "FAIL" } else { "INFO" }) -Color $(if ($failCount -gt 0) { "Red" } else { "Gray" })
 Write-Log "  Skipped:  $skipCount" -Level INFO
+if ($airGapRoots.Count -gt 0) {
+    Write-Log "  Air-gap:  $airGapOk ok, $airGapFail fail, $airGapBusy in progress ($airGapReachable of $($airGapRoots.Count) media reachable)" -Level $(if ($airGapFail -gt 0) { "FAIL" } else { "INFO" }) -Color $(if ($airGapFail -gt 0) { "Red" } else { "Gray" })
+}
 
-# Meta-monitoring: ping a health check for the monitor itself
+# Meta-monitoring: ping a health check for the monitor itself.
+#
+# A run that could reach NONE of its configured repositories has checked
+# nothing, and must not say otherwise. On 2026-09-02 RAHR's NAS stayed off
+# after a site outage; the monitor logged "Repository not accessible" twice,
+# reported 0/0/0 and pinged the meta check healthy every hour, so a dead NAS
+# raised no alert until the per-machine checks expired a day and a half
+# later. Now that run pings /fail with the reason in the body.
 $metaSlug = "$($config.companyId)-monitor-health".ToLower()
-$metaMessage = "[BackupCheck v$($script:Version)] Completed: $successCount ok, $warnCount warn, $failCount fail, $skipCount skip"
+$noRepoReachable = ($repositories.Count -gt 0 -and $reachableRepoCount -eq 0)
+if ($noRepoReachable) {
+    $metaMessage = "[BackupCheck v$($script:Version)] FAILED: 0 of $($repositories.Count) configured repositories reachable - nothing was checked ($(($repositories | ForEach-Object { $_.Path }) -join ', '))"
+    Write-Log "No configured repository reachable - reporting the monitor FAILED" -Level FAIL -Color Red
+}
+else {
+    $metaMessage = "[BackupCheck v$($script:Version)] Completed: $successCount ok, $warnCount warn, $failCount fail, $skipCount skip ($reachableRepoCount of $($repositories.Count) repositories reachable)"
+}
 try {
-    $metaEndpoint = "$($config.healthchecksBaseUrl)/$pingKey/$metaSlug`?create=1"
+    $metaEndpoint = "$($config.healthchecksBaseUrl)/$pingKey/$metaSlug"
+    if ($noRepoReachable) { $metaEndpoint += "/fail" }
+    $metaEndpoint += "?create=1"
     Invoke-WebRequest -Uri $metaEndpoint -Method POST -Body $metaMessage -ContentType "text/plain" -UseBasicParsing | Out-Null
-    Write-Log "Meta-monitoring ping sent ($metaSlug)" -Level OK -Color Green
+    Write-Log "Meta-monitoring ping sent ($metaSlug$(if ($noRepoReachable) { ', /fail' }))" -Level $(if ($noRepoReachable) { "FAIL" } else { "OK" }) -Color $(if ($noRepoReachable) { "Red" } else { "Green" })
 }
 catch {
     Write-Log "Meta-monitoring ping failed: $_" -Level WARN -Color Yellow
@@ -1150,7 +1396,7 @@ if ($script:MountedShares.Count -gt 0) {
     exit 1
 }
 
-if ($failCount -gt 0) {
+if ($failCount -gt 0 -or $airGapFail -gt 0 -or $noRepoReachable) {
     exit 1
 }
 

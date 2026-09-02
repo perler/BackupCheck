@@ -5,6 +5,41 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.5.0] - 2026-09-02
+
+Client `Monitor-Backups.ps1` v2.5.0. Deployed by hand to RAHR DC-001 on 2026-09-02; **not**
+published to the coordinator `stable` channel yet, so no other client picks it up on its own.
+Both changes come from the RAHR air-gap backup failure (Asana `✨ 🔴 RAHR USB Copy`,
+1218079300179580) and the 2026-09-02 NAS001 outage.
+
+### Added
+- **Air-gap media are walked and every machine's newest image chain is asserted restorable.**
+  New optional config key `airGapRepositories`: a list of medium roots (the USB Copy targets,
+  e.g. `\\nas001\usbshare1`), each holding `<share-copy>\<MACHINE>\...\*.mrimg`. Per
+  machine the newest chain (by last-written member) must have a `-00-00` base **and** every
+  member must carry the Macrium end-of-file marker `__79241006_2651_11D4_` in its last 64
+  bytes — the test that separated four complete-but-misnamed base images from three copies
+  that died mid-write on RAHR's media on 2026-08-16, at one 64-byte read per file. Files not
+  named as chain members (USB Copy `_Conflict` artefacts, `.tmp` fragments) are counted but
+  never satisfy the assertion, because Macrium cannot see them either. A member without the
+  marker written within the last hour is reported as in progress rather than failed.
+  The verdict goes to a single check `{companyId}-usb-copy` (tags `backup macrium <code>
+  usbcopy`, HC default period/grace) with one line per machine in the ping body; any failing
+  machine fails the check — a failed assertion is that machine's air-gap copy being
+  unrestorable, and is never a skip. No medium reachable → no ping, so the check goes late.
+  This replaces the paused hc.io check "RAHR USB Copy" (4094d7dc-…), which was fed by a DSM
+  disk-warning webhook and could not see the backup it was named after.
+
+### Changed
+- **A run that reaches none of its configured repositories now reports the monitor FAILED.**
+  On 2026-09-02 RAHR's NAS001 did not come back after a site power outage; the monitor logged
+  "Repository not accessible" for both shares, summarised 0 healthy / 0 failed / 0 skipped and
+  still pinged `rahr-monitor-health` healthy every hour, so a dead NAS raised no alert until the
+  per-machine checks expired ~42 h later. The meta ping is now `/fail`, with the reason and the
+  repository list in the body, whenever `repositories` is non-empty and zero of them passed
+  `Test-Path`. The success body now also carries `N of M repositories reachable`. Exit code is
+  1 in that case, as it is for any failed machine or failed air-gap assertion.
+
 ## [2.4.0] - 2026-08-20
 
 Client `Monitor-Backups.ps1` v2.4.0, published to the `stable` channel on 2026-08-20.

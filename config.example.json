@@ -4,6 +4,10 @@
     "\\\\server\\backup_share",
     { "path": "D:\\srv001", "machine": "SRV001" }
   ],
+  "airGapRepositories": [
+    "\\\\server\\usbshare1",
+    "\\\\server\\usbshare2"
+  ],
   "backupMaxAgeHours": 24,
   "backupFilePattern": "*.mrimg",
   "skipIfRunning": true,
