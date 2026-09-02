@@ -18,7 +18,7 @@
     configured repository is reachable no longer reports the monitor healthy.
 
 .NOTES
-    Version: 2.5.0
+    Version: 2.5.1
     Requires: PowerShell 5.1+
 #>
 
@@ -40,7 +40,7 @@ $ErrorActionPreference = "Stop"
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
 # Script version
-$script:Version = "2.5.0"
+$script:Version = "2.5.1"
 
 # A Macrium .mrimg that was written to completion carries this ASCII marker
 # inside its last 64 bytes; a truncated copy does not. Proven on RAHR's USB
@@ -1235,7 +1235,15 @@ $airGapReachable = 0
 foreach ($root in $airGapRoots) {
     Write-Log "Scanning air-gap medium: $root" -Color Yellow
     if (-not (Test-Path $root -ErrorAction SilentlyContinue)) {
-        Write-Log "Air-gap medium not accessible: $root" -Level WARN -Color Yellow
+        # Say WHY. "Not accessible" alone cannot tell a medium that was pulled
+        # from one the account may not read, and those need opposite actions:
+        # 2026-09-02 at RAHR both usbshares existed with the media attached and
+        # the monitor account simply had no permission on them, which read as
+        # "no disk" in the log.
+        $reason = "path not found"
+        try { Get-ChildItem $root -ErrorAction Stop | Out-Null }
+        catch { $reason = $_.Exception.Message }
+        Write-Log "Air-gap medium not accessible: $root ($reason)" -Level WARN -Color Yellow
         continue
     }
     $airGapReachable++

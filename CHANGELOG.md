@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.5.1] - 2026-09-02
+
+### Fixed
+- **An unreachable air-gap medium now logs why.** The line read only "Air-gap medium not
+  accessible: <path>", which cannot separate a medium that was pulled from one the monitor
+  account may not read — and those need opposite actions. On RAHR's first live run after the
+  NAS came back, both `\\nas001\usbshare1` and `\\nas001\usbshare2` were exported with the
+  WD media attached, and the account (`nas001\backupadmin`) simply had no permission on them;
+  the log looked identical to "no disk inserted". The underlying exception message is now
+  appended.
+
 ## [2.5.0] - 2026-09-02
 
 Client `Monitor-Backups.ps1` v2.5.0. Deployed by hand to RAHR DC-001 on 2026-09-02; **not**
