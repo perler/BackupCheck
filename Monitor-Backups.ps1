@@ -1795,6 +1795,10 @@ foreach ($repo in $repositories) {
             else {
                 Write-Log "  [SKIP] $($health.MachineName): $statusDetail (stale; deferring to HC period/coordinator)" -Level SKIP -Color DarkGray
                 $skipCount++
+                # The coordinator's online-hours budget only exists for wks/nb;
+                # it would fail a stale non-standard name immediately, so those
+                # keep the plain v2.2.4 skip.
+                if ($devType -notin @('wks', 'nb')) { continue }
                 $isStale = $true
             }
         }
