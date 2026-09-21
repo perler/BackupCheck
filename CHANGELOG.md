@@ -5,6 +5,23 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.6.0] - 2026-09-21
+
+### Added
+- **Leftover `.error_loading` files are now deleted automatically instead of only warned about.**
+  The monitor has detected these since the corruption check was added, but the fix was always a
+  human deleting them by hand — the WARN status message literally said "delete them". Once a
+  `.error_loading`/`.error_loading<N>` file is at least `errorFileMinAgeHours` old (default 24h)
+  and no backup is currently running for that machine (reusing the existing `skipIfRunning`
+  detection), it is removed and the deletion is logged with the full path and size. A delete that
+  fails (e.g. the task account has no delete right on the share) is logged as a WARN and the file
+  is left in place, still counting as a corrupted file exactly as before. The health verdict and
+  status message are recomputed after cleanup, so a machine whose only problem was leftover error
+  files goes back to a plain OK, with a note ("removed N leftover .error_loading file(s)") in the
+  status message. New optional config keys `deleteErrorFiles` (default `true`) and
+  `errorFileMinAgeHours` (default `24`) — set `deleteErrorFiles` to `false` for the old
+  detect-and-warn-only behaviour.
+
 ## [2.5.1] - 2026-09-02
 
 ### Fixed

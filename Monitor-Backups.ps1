@@ -16,9 +16,11 @@
     newest image chain is asserted restorable (a -00-00 base exists and every
     member carries the Macrium end-of-file marker); a run in which no
     configured repository is reachable no longer reports the monitor healthy.
+    v2.6 adds: leftover .error_loading files are deleted automatically once
+    they are old enough and no backup is running for that machine.
 
 .NOTES
-    Version: 2.5.1
+    Version: 2.6.0
     Requires: PowerShell 5.1+
 #>
 
@@ -40,7 +42,7 @@ $ErrorActionPreference = "Stop"
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
 # Script version
-$script:Version = "2.5.1"
+$script:Version = "2.6.0"
 
 # A Macrium .mrimg that was written to completion carries this ASCII marker
 # inside its last 64 bytes; a truncated copy does not. Proven on RAHR's USB
@@ -331,7 +333,13 @@ function Test-BackupHealth {
         [string]$RunningFilePattern = "backup_running*",
 
         [Parameter()]
-        [string]$MachineName
+        [string]$MachineName,
+
+        [Parameter()]
+        [bool]$DeleteErrorFiles = $true,
+
+        [Parameter()]
+        [int]$ErrorFileMinAgeHours = 24
     )
 
     $result = @{
@@ -346,6 +354,7 @@ function Test-BackupHealth {
         BackupCount = 0
         HasErrorFiles = $false
         ErrorFileCount = 0
+        DeletedErrorFileCount = 0
         IsWarning = $false
     }
 
@@ -366,6 +375,35 @@ function Test-BackupHealth {
     # files on 2026-08-20 when 11 were on disk. Filter wide, then match exactly.
     $errorFiles = @(Get-ChildItem -Path $Path -Filter "*.error_loading*" -Recurse -File -ErrorAction SilentlyContinue |
         Where-Object { $_.Name -match '\.error_loading\d*$' })
+
+    # Leftover .error_loading files are safe to remove: we already know (by
+    # having reached this point) that no backup is running for this machine,
+    # and the age floor keeps a file from a copy that just died - and hasn't
+    # aged into the running-marker window - from being deleted out from under
+    # a retry. A delete that fails (e.g. the task account has no delete right
+    # on the share) is logged and left in place; it keeps counting as a
+    # corrupted file exactly as before.
+    if ($DeleteErrorFiles -and $errorFiles) {
+        $deleteCutoff = (Get-Date).AddHours(-$ErrorFileMinAgeHours)
+        $candidates = @($errorFiles | Where-Object { $_.LastWriteTime -le $deleteCutoff })
+        $deletedPaths = @()
+        foreach ($f in $candidates) {
+            try {
+                $sizeBytes = $f.Length
+                Remove-Item -LiteralPath $f.FullName -Force -ErrorAction Stop
+                Write-Log "Deleted leftover error file: $($f.FullName) ($sizeBytes bytes)" -Level INFO
+                $deletedPaths += $f.FullName
+            }
+            catch {
+                Write-Log "Could not delete leftover error file: $($f.FullName): $($_.Exception.Message)" -Level WARN -Color Yellow
+            }
+        }
+        if ($deletedPaths.Count -gt 0) {
+            $result.DeletedErrorFileCount = $deletedPaths.Count
+            $errorFiles = @($errorFiles | Where-Object { $deletedPaths -notcontains $_.FullName })
+        }
+    }
+
     if ($errorFiles) {
         $result.HasErrorFiles = $true
         $result.ErrorFileCount = ($errorFiles | Measure-Object).Count
@@ -1035,6 +1073,11 @@ if (-not $SkipUpdateCheck) {
 Write-Log "Company ID: $($config.companyId)"
 Write-Log "Max backup age: $($config.backupMaxAgeHours) hours"
 
+# Leftover .error_loading files: delete automatically by default. Both keys
+# are optional so a config.json from before v2.6.0 keeps working unchanged.
+$deleteErrorFiles = if ($config.PSObject.Properties.Name -contains 'deleteErrorFiles') { [bool]$config.deleteErrorFiles } else { $true }
+$errorFileMinAgeHours = if ($config.PSObject.Properties.Name -contains 'errorFileMinAgeHours') { [int]$config.errorFileMinAgeHours } else { 24 }
+
 # Build tags list: automatic tags + custom tags from config
 $tags = @("backup", "macrium", $config.companyId.ToLower())
 if ($config.tags -and $config.tags.Count -gt 0) {
@@ -1145,7 +1188,9 @@ foreach ($repo in $repositories) {
             -FilePattern $config.backupFilePattern `
             -SkipIfRunning $config.skipIfRunning `
             -RunningFilePattern $config.runningFilePattern `
-            -MachineName $machine.Name
+            -MachineName $machine.Name `
+            -DeleteErrorFiles $deleteErrorFiles `
+            -ErrorFileMinAgeHours $errorFileMinAgeHours
 
         $slug = Get-CheckSlug -CompanyId $config.companyId -MachineName $health.MachineName
 
@@ -1174,6 +1219,10 @@ foreach ($repo in $repositories) {
         }
         else {
             $freshDetail
+        }
+
+        if ($health.DeletedErrorFileCount -gt 0) {
+            $statusDetail = "removed $($health.DeletedErrorFileCount) leftover .error_loading file(s); $statusDetail"
         }
 
         if ($health.HasErrorFiles -and -not $health.IsFresh) {

@@ -12,6 +12,8 @@
   "backupFilePattern": "*.mrimg",
   "skipIfRunning": true,
   "runningFilePattern": "backup_running*",
+  "deleteErrorFiles": true,
+  "errorFileMinAgeHours": 24,
   "healthchecksBaseUrl": "https://hc-ping.com",
   "autoDetectRepositories": true,
   "tags": [],
