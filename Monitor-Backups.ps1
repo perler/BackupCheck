@@ -25,9 +25,17 @@
     online/offline state instead of them running out their own HC period
     while switched off (the direct-to-healthchecks.io fallback keeps
     skipping them, unchanged, when there's no coordinator to make that call).
+    v2.6.2 adds: verifyPassword may be a single password or a list of them,
+    tried in order for an image set encrypted with more than one password
+    across its history - only once every password fails as a password error
+    does the monitor log the existing "password-protected" WARN; and
+    config.json, .env and .verify-state are checked on every run and locked
+    down to SYSTEM, BUILTIN\Administrators and the account the scheduled
+    task runs as, since config.json can hold verifyPassword and .env holds
+    NAS/coordinator credentials.
 
 .NOTES
-    Version: 2.6.1
+    Version: 2.6.2
     Requires: PowerShell 5.1+
 #>
 
@@ -49,7 +57,7 @@ $ErrorActionPreference = "Stop"
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
 # Script version
-$script:Version = "2.6.1"
+$script:Version = "2.6.2"
 
 # A Macrium .mrimg that was written to completion carries this ASCII marker
 # inside its last 64 bytes; a truncated copy does not. Proven on RAHR's USB
@@ -854,11 +862,20 @@ function Update-ImageSetVerify {
         - State exists, process still alive: no-op (no second launch).
         - State exists, process dead, result says exit 0: report
           JustPassed once, clear the state.
-        - State exists, process dead, result says exit 1: report
-          ForceFail, and KEEP the state (so it forces a fail every run)
-          until a newer backup than the one that failed appears.
-        - State exists, process dead, no result file: WARN and retry once;
-          if the retry also dies without a result, give up and clear it.
+        - State exists, process dead, result says exit 1, and every failure
+          line is a password error: if VerifyPasswords has another entry
+          after the one just tried, it is launched immediately against the
+          SAME state (password index incremented, nothing else touched) -
+          only once every password has been tried does this fall through to
+          the existing password-protected WARN and clear the state. Only the
+          index is ever persisted to disk, never a password.
+        - State exists, process dead, result says exit 1 (not a password
+          error, or no password left to try): report ForceFail, and KEEP the
+          state (so it forces a fail every run) until a newer backup than
+          the one that failed appears.
+        - State exists, process dead, no result file: WARN and retry once
+          (same password index); if the retry also dies without a result,
+          give up and clear it.
     .OUTPUTS
         @{ ForceFail; FailMessage; JustPassed; ImageId }
     #>
@@ -885,7 +902,7 @@ function Update-ImageSetVerify {
         [string]$MrverifyPath,
 
         [Parameter()]
-        [string]$VerifyPassword,
+        [string[]]$VerifyPasswords = @(),
 
         [Parameter()]
         [bool]$Recurse = $true,
@@ -940,13 +957,42 @@ function Update-ImageSetVerify {
                     $state = $null
                 }
                 elseif (Test-VerifyPasswordOnly -LogPath $state.logPath) {
-                    # Every failure is "Password Error": the images are
-                    # encrypted and no (or a wrong) verifyPassword is set.
-                    # That says nothing about the images, so never fail on it.
-                    Write-Log "  Macrium verify for ${MachineName} (image set $($state.imageId)) could not run: images are password-protected, set verifyPassword in config.json ($($state.logPath))" -Level WARN -Color Yellow
-                    Remove-Item -LiteralPath $statePath -Force -ErrorAction SilentlyContinue
-                    Remove-Item -LiteralPath $state.resultPath -Force -ErrorAction SilentlyContinue
-                    $state = $null
+                    # Every failure is "Password Error" for the password just
+                    # tried. That says nothing about the images, so it never
+                    # fails on its own - but if verifyPassword configured more
+                    # than one, the next one is worth trying before giving up.
+                    $pwIndex = if ($state.PSObject.Properties.Name -contains 'passwordIndex' -and $null -ne $state.passwordIndex) { [int]$state.passwordIndex } else { 0 }
+                    $nextPwIndex = $pwIndex + 1
+                    if ($MrverifyPath -and $VerifyPasswords.Count -gt $nextPwIndex) {
+                        Write-Log "  Macrium verify for ${MachineName} (image set $($state.imageId)): password $($pwIndex + 1) of $($VerifyPasswords.Count) failed - trying the next one" -Level INFO
+                        $target = Join-Path $MachinePath "$($state.imageId)-*.mrimg"
+                        $launch = Start-ImageSetVerify -MrverifyPath $MrverifyPath -TargetPattern $target -Recurse $Recurse `
+                            -Password $VerifyPasswords[$nextPwIndex] -LogPath $state.logPath -ResultPath $state.resultPath -ShellExe $ShellExe
+                        $newState = @{
+                            imageId = $state.imageId
+                            machineName = $MachineName
+                            targetPattern = $target
+                            startTime = $launch.StartTime.ToString('o')
+                            pid = $launch.Pid
+                            logPath = $state.logPath
+                            resultPath = $state.resultPath
+                            newestMemberTime = $state.newestMemberTime
+                            passwordIndex = $nextPwIndex
+                            retried = $false
+                        }
+                        $newState | ConvertTo-Json | Out-File -FilePath $statePath -Encoding UTF8 -Force
+                        $verify.ImageId = $state.imageId
+                        return $verify
+                    }
+                    else {
+                        # No password left to try (or mrverify went missing
+                        # between launch and now): the images are encrypted
+                        # and no configured password opens them.
+                        Write-Log "  Macrium verify for ${MachineName} (image set $($state.imageId)) could not run: images are password-protected, set verifyPassword in config.json ($($state.logPath))" -Level WARN -Color Yellow
+                        Remove-Item -LiteralPath $statePath -Force -ErrorAction SilentlyContinue
+                        Remove-Item -LiteralPath $state.resultPath -Force -ErrorAction SilentlyContinue
+                        $state = $null
+                    }
                 }
                 else {
                     $newest = Get-NewestBackupTime -Path $MachinePath -FilePattern $FilePattern
@@ -981,9 +1027,11 @@ function Update-ImageSetVerify {
             else {
                 Write-Log "  Macrium verify for ${MachineName} (image set $($state.imageId), PID $($state.pid)) is gone with no result - retrying once" -Level WARN -Color Yellow
                 if ($MrverifyPath) {
+                    $pwIndex = if ($state.PSObject.Properties.Name -contains 'passwordIndex' -and $null -ne $state.passwordIndex) { [int]$state.passwordIndex } else { 0 }
+                    $retryPassword = if ($VerifyPasswords.Count -gt $pwIndex) { $VerifyPasswords[$pwIndex] } else { $null }
                     $target = Join-Path $MachinePath "$($state.imageId)-*.mrimg"
                     $launch = Start-ImageSetVerify -MrverifyPath $MrverifyPath -TargetPattern $target -Recurse $Recurse `
-                        -Password $VerifyPassword -LogPath $state.logPath -ResultPath $state.resultPath -ShellExe $ShellExe
+                        -Password $retryPassword -LogPath $state.logPath -ResultPath $state.resultPath -ShellExe $ShellExe
                     $newState = @{
                         imageId = $state.imageId
                         machineName = $MachineName
@@ -993,6 +1041,7 @@ function Update-ImageSetVerify {
                         logPath = $state.logPath
                         resultPath = $state.resultPath
                         newestMemberTime = $state.newestMemberTime
+                        passwordIndex = $pwIndex
                         retried = $true
                     }
                     $newState | ConvertTo-Json | Out-File -FilePath $statePath -Encoding UTF8 -Force
@@ -1043,8 +1092,9 @@ function Update-ImageSetVerify {
 
         $newestMemberTime = Get-NewestBackupTime -Path $MachinePath -FilePattern "$imageId-*.mrimg"
 
+        $firstPassword = if ($VerifyPasswords.Count -gt 0) { $VerifyPasswords[0] } else { $null }
         $launch = Start-ImageSetVerify -MrverifyPath $MrverifyPath -TargetPattern $target -Recurse $Recurse `
-            -Password $VerifyPassword -LogPath $logPath -ResultPath $resultPath -ShellExe $ShellExe
+            -Password $firstPassword -LogPath $logPath -ResultPath $resultPath -ShellExe $ShellExe
 
         $newState = @{
             imageId = $imageId
@@ -1055,6 +1105,7 @@ function Update-ImageSetVerify {
             logPath = $logPath
             resultPath = $resultPath
             newestMemberTime = if ($newestMemberTime) { $newestMemberTime.ToString('o') } else { $null }
+            passwordIndex = 0
             retried = $false
         }
         $newState | ConvertTo-Json | Out-File -FilePath $statePath -Encoding UTF8 -Force
@@ -1582,7 +1633,20 @@ $errorFileMinAgeHours = if ($config.PSObject.Properties.Name -contains 'errorFil
 # see Find-MrverifyExe and Update-ImageSetVerify above.
 $verifyAfterErrorCleanup = if ($config.PSObject.Properties.Name -contains 'verifyAfterErrorCleanup') { [bool]$config.verifyAfterErrorCleanup } else { $true }
 $configuredMrverifyPath = if ($config.PSObject.Properties.Name -contains 'mrverifyPath') { [string]$config.mrverifyPath } else { $null }
-$verifyPassword = if ($config.PSObject.Properties.Name -contains 'verifyPassword') { [string]$config.verifyPassword } else { $null }
+
+# verifyPassword may be a single string or an array of strings, tried in
+# order (v2.6.2) - an image set can be encrypted with more than one password
+# across its history. Normalised to an array here so Update-ImageSetVerify
+# never has to ask "is this a string?".
+$verifyPasswords = @()
+if ($config.PSObject.Properties.Name -contains 'verifyPassword' -and $null -ne $config.verifyPassword) {
+    if ($config.verifyPassword -is [array]) {
+        $verifyPasswords = @($config.verifyPassword | ForEach-Object { [string]$_ })
+    }
+    else {
+        $verifyPasswords = @([string]$config.verifyPassword)
+    }
+}
 
 $script:VerifyStateDir = Join-Path $ScriptDir ".verify-state"
 $mrverifyPath = $null
@@ -1730,7 +1794,7 @@ foreach ($repo in $repositories) {
         if ($verifyAfterErrorCleanup) {
             $verify = Update-ImageSetVerify -StateDir $script:VerifyStateDir -Slug $slug -MachineName $health.MachineName `
                 -MachinePath $machine.Path -DeletedErrorFilePaths $health.DeletedErrorFilePaths `
-                -FilePattern $config.backupFilePattern -MrverifyPath $mrverifyPath -VerifyPassword $verifyPassword
+                -FilePattern $config.backupFilePattern -MrverifyPath $mrverifyPath -VerifyPasswords $verifyPasswords
         }
 
         # Build status message. Corruption and staleness are independent
