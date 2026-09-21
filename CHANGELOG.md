@@ -5,6 +5,35 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.6.2] - 2026-09-21
+
+### Added
+- **`verifyPassword` may now be a list of passwords, tried in order.** An image set can be
+  encrypted with more than one password across its history (STPH has two Encryption credentials
+  on one Macrium configuration in IT Portal). `config.json`'s `verifyPassword` still accepts a
+  single string, unchanged; it can now also be a JSON array. Passwords are tried one at a time —
+  the running verify launches with the first, and if it fails and every failure line in the
+  mrverify log is a password error, the next one is launched against the same state (only the
+  index is persisted, never a password, and it's never logged). Only once every password has
+  failed does the monitor fall back to the existing "password-protected" WARN.
+- **`config.json`, `.env` and `.verify-state` are locked down to SYSTEM, BUILTIN\Administrators and
+  the scheduled task's own account.** `config.json` can hold `verifyPassword` and `.env` holds
+  NAS/coordinator credentials, so on every run the monitor now checks each path's ACL and, if it
+  grants read access to anyone else (BUILTIN\Users, Authenticated Users, Everyone, or anything
+  else) or carries an inherited rule, disables inheritance and rewrites it to exactly those three
+  identities — by SID, never by name, since these servers can be German-language Windows. Logged
+  once, only when something actually had to change. A failure to set the ACL only WARNs; it never
+  crashes the run.
+- **`install-client.sh` now fetches and writes `verifyPassword` itself.** It looks up the client's
+  Macrium image-set password(s) in IT Portal — AdditionalCredentials of type Encryption hanging off
+  the client's Macrium Configuration (type Backup, name matching `/macrium|reflect/i`) — and writes
+  them into the generated `config.json` as `verifyPassword` (a string for one, an array for
+  several), through the same staged-JSON-file channel the AD\automat and NAS credentials already
+  use — never an argv, never the ssh command line, never echoed. New `--update-verify-password`
+  flag refreshes just that key on an already-installed target, leaving the rest of `config.json`
+  alone; it fails without touching the target if IT Portal has no Encryption credential for the
+  client.
+
 ## [2.6.1] - 2026-09-21
 
 ### Fixed

@@ -2,15 +2,19 @@
 # Install BackupCheck on a Windows server, fully driven from this workstation.
 #
 # Usage: ./install-client.sh <CLIENT-CODE> <TARGET-HOST> [--ssh-user USER] [--task-user USER]
-#            [--repo <path>[=<machine>] ...] [--dry-run]
+#            [--repo <path>[=<machine>] ...] [--dry-run] [--update-verify-password]
 #   ./install-client.sh PR 192.168.101.12
 #   ./install-client.sh RAH 157.90.91.117 --repo 'D:\srv001=SRV001' --repo '\\nas003\backup=SRV001-offsite'
+#   ./install-client.sh STPH 10.0.4.20 --update-verify-password
 #
 # Reads from BackupCheck/.env: HC_PING_KEY, HC_API_KEY, COORDINATOR_URL, COORDINATOR_API_KEY
 # Looks up via IT Portal:
 #   - AD\automat password (object Account, type AD, username automat) — fails if missing.
 #   - NAS share user/password (backup or backupadmin on the client's NAS device), only when
 #     at least one repository is a UNC path.
+#   - Macrium image-set password(s): AdditionalCredentials of type Encryption hanging off the
+#     client's Macrium Configuration (type Backup, name matching /macrium|reflect/i). Optional —
+#     most clients don't encrypt their images, and config.json simply gets no verifyPassword.
 #
 # Detects Macrium repos via mrserver.exe over SSH, writes config + .env on target,
 # downloads release zip from coordinator, registers BackupMonitor scheduled task.
@@ -20,6 +24,13 @@
 # name a flat repository's machine explicitly (<path>=<machine>: the directory itself is the
 # machine, no per-machine subdirectory is enumerated). A spec with no "=machine" behaves like
 # an auto-detected repository (each subdirectory enumerated as a machine).
+#
+# --update-verify-password skips the whole install (no AD/task-account/repo/NAS discovery, no
+# scheduled task touched) and ONLY refreshes verifyPassword in the existing C:\BackupCheck\
+# config.json on TARGET-HOST from IT Portal, leaving every other key in the file alone. Use it
+# after an image-set password changes, or to add verifyPassword to a client installed before it
+# had one. Fails (config.json on the target is left untouched) if IT Portal has no Encryption
+# credential for the client.
 
 set -euo pipefail
 
@@ -29,21 +40,24 @@ SSH_USER="admin"
 DRY_RUN=0
 TASK_USER_ARG=""
 REPO_SPECS=()
+UPDATE_VERIFY_PW_ONLY=0
 
 while [[ $# -gt 2 ]]; do
   case "$3" in
-    --ssh-user)   SSH_USER="$4"; shift 2 ;;
-    --dry-run)    DRY_RUN=1; shift ;;
-    --task-user)  TASK_USER_ARG="$4"; shift 2 ;;
-    --repo)       REPO_SPECS+=("$4"); shift 2 ;;
-    *)            echo "Unknown flag: $3" >&2; exit 2 ;;
+    --ssh-user)                SSH_USER="$4"; shift 2 ;;
+    --dry-run)                 DRY_RUN=1; shift ;;
+    --task-user)                TASK_USER_ARG="$4"; shift 2 ;;
+    --repo)                    REPO_SPECS+=("$4"); shift 2 ;;
+    --update-verify-password)  UPDATE_VERIFY_PW_ONLY=1; shift ;;
+    *)                          echo "Unknown flag: $3" >&2; exit 2 ;;
   esac
 done
 
 if [[ -z "$CLIENT_CODE" || -z "$TARGET_HOST" ]]; then
   cat >&2 <<EOF
-Usage: $0 <CLIENT-CODE> <TARGET-HOST> [--ssh-user USER] [--task-user USER] [--repo <path>[=<machine>] ...] [--dry-run]
+Usage: $0 <CLIENT-CODE> <TARGET-HOST> [--ssh-user USER] [--task-user USER] [--repo <path>[=<machine>] ...] [--dry-run] [--update-verify-password]
 Example: $0 PR 192.168.101.12
+Example: $0 STPH 10.0.4.20 --update-verify-password
 EOF
   exit 2
 fi
@@ -55,6 +69,45 @@ red()   { printf '\033[31m%s\033[0m\n' "$*"; }
 green() { printf '\033[32m%s\033[0m\n' "$*"; }
 cyan()  { printf '\033[36m%s\033[0m\n' "$*"; }
 fail()  { red "ERROR: $*"; exit 1; }
+
+# Fetches this client's Macrium image-set password(s) from IT Portal: every
+# Configuration (type Backup) whose name matches /macrium|reflect/i, and
+# every AdditionalCredential of type Encryption hanging off one of those.
+# Prints a JSON array of password strings on stdout (possibly empty — no
+# Macrium config or no Encryption credential is normal, not an error) on
+# success, or NOT_FOUND / ERR:<detail> on stderr with a non-zero exit on
+# failure. Output is only ever captured into a variable by the caller via
+# command substitution — never echoed, never put on an argv or ssh command
+# line — the same channel the AD\automat and NAS credential lookups above
+# already use. --dns-result-order=ipv4first: without it, fetch can time out
+# resolving doku.erler-edv-beratung.de over IPv6 from this workstation.
+fetch_verify_passwords_json() {
+  (cd "$ITPORTAL_DIR" && CLIENT_CODE="$CLIENT_CODE" node --dns-result-order=ipv4first -e "
+const config = require('./config').load();
+const axios = require('axios');
+const code = process.env.CLIENT_CODE;
+const http = axios.create({ baseURL: config.baseURL, headers: { Authorization: config.apiKey } });
+(async () => {
+  const cR = await http.get('/Companies/', { params: { abbreviation: code } });
+  const company = (cR.data.data || cR.data).results[0];
+  if (!company) { console.error('NOT_FOUND'); process.exit(3); }
+  const cfgR = await http.get('/Configurations/', { params: { companyId: company.id, limit: 100 } });
+  const configs = (cfgR.data.data || cfgR.data).results;
+  const macriumConfigs = configs.filter(c => /macrium|reflect/i.test(c.name || ''));
+  const passwords = [];
+  for (const cfg of macriumConfigs) {
+    const credR = await http.get('/AdditionalCredentials/', { params: { portalObjectId: cfg.id, limit: 100 } });
+    const creds = (credR.data.data || credR.data).results;
+    for (const r of creds) {
+      if (r.portalObject && r.portalObject.id === cfg.id && r.type === 'Encryption' && r.password) {
+        passwords.push(r.password);
+      }
+    }
+  }
+  process.stdout.write(JSON.stringify(passwords));
+})().catch(e => { console.error('ERR:' + (e.response?.data ? JSON.stringify(e.response.data) : e.message)); process.exit(5); });
+" 2>&1)
+}
 
 # --- 1. Load workstation .env ---
 # The IT Portal lookups below run through tools/itportal, which reads ITPORTAL_API_KEY from
@@ -71,6 +124,84 @@ set -a; source "$REPO_ROOT/.env"; set +a
 : "${COORDINATOR_URL:?missing in .env}"
 : "${COORDINATOR_API_KEY:?missing in .env}"
 : "${ITPORTAL_API_KEY:?not in the environment and not in ~/.env — IT Portal lookups would 401}"
+
+# --- Update-only mode: refresh verifyPassword in an EXISTING remote
+# config.json and stop. No AD/task-account/repo/NAS discovery and no
+# scheduled task touched — none of that is needed to update one key in a
+# file that is already on the target.
+if [[ "$UPDATE_VERIFY_PW_ONLY" == "1" ]]; then
+  cyan "Update-only: refreshing verifyPassword in C:\\BackupCheck\\config.json on $SSH_USER@$TARGET_HOST for $CLIENT_CODE"
+
+  cyan "Looking up Macrium image-set password(s) in IT Portal for $CLIENT_CODE..."
+  VERIFY_PW_RAW=$(fetch_verify_passwords_json) || {
+    case "$VERIFY_PW_RAW" in
+      NOT_FOUND) fail "Client $CLIENT_CODE not found in IT Portal." ;;
+      *)         fail "Macrium password lookup failed: $VERIFY_PW_RAW" ;;
+    esac
+  }
+  VERIFY_PW_COUNT=$(printf '%s' "$VERIFY_PW_RAW" | python3 -c "import json,sys; print(len(json.load(sys.stdin)))")
+  if [[ "$VERIFY_PW_COUNT" -eq 0 ]]; then
+    fail "No Encryption credential found in IT Portal for $CLIENT_CODE's Macrium configuration — C:\\BackupCheck\\config.json on $TARGET_HOST left untouched."
+  fi
+  green "  Found $VERIFY_PW_COUNT Macrium encryption credential(s)"
+
+  if [[ $DRY_RUN -eq 1 ]]; then
+    cyan "[dry-run] Would update verifyPassword ($VERIFY_PW_COUNT credential(s)) in C:\\BackupCheck\\config.json on $TARGET_HOST. Stopping."
+    exit 0
+  fi
+
+  TMPDIR=$(mktemp -d)
+  STAGING_CREATED=0
+  cleanup() {
+    rm -rf "$TMPDIR"
+    if [[ "$STAGING_CREATED" == "1" ]]; then
+      ssh "$SSH_USER@$TARGET_HOST" 'powershell -NoProfile -Command "Remove-Item C:\BackupCheck-staging -Recurse -Force -EA SilentlyContinue"' >/dev/null 2>&1 || true
+    fi
+  }
+  trap cleanup EXIT
+
+  # Stage {"verifyPassword": "pw"} or {"verifyPassword": ["pw1","pw2"]} — a
+  # string when there is one, an array when there are several, matching what
+  # a fresh install writes. The password content only ever touches this
+  # local file (deleted by the trap above) and the scp'd copy on the
+  # target — never an argv, never the ssh command line, never echoed.
+  printf '%s' "$VERIFY_PW_RAW" > "$TMPDIR/verify-passwords-raw.json"
+  python3 - "$TMPDIR/verify-passwords-raw.json" "$TMPDIR/verify-password.json" <<'PYEOF'
+import json, sys
+raw_path, out_path = sys.argv[1], sys.argv[2]
+with open(raw_path) as f:
+    pw_list = json.load(f)
+value = pw_list[0] if len(pw_list) == 1 else pw_list
+with open(out_path, "w") as f:
+    json.dump({"verifyPassword": value}, f)
+PYEOF
+  rm -f "$TMPDIR/verify-passwords-raw.json"
+
+  cat > "$TMPDIR/update-verify-password.ps1" <<'REMOTEEOF'
+$ErrorActionPreference = "Stop"
+$configPath = "C:\BackupCheck\config.json"
+if (-not (Test-Path $configPath)) {
+    throw "config.json not found at $configPath - is BackupCheck installed here? Run a full install first."
+}
+$staging = "C:\BackupCheck-staging"
+$payload = Get-Content (Join-Path $staging "verify-password.json") -Raw | ConvertFrom-Json
+$config = Get-Content $configPath -Raw | ConvertFrom-Json
+$config | Add-Member -NotePropertyName verifyPassword -NotePropertyValue $payload.verifyPassword -Force
+$config | ConvertTo-Json -Depth 10 | Out-File -FilePath $configPath -Encoding UTF8 -Force
+Write-Host "verifyPassword updated in $configPath" -ForegroundColor Green
+REMOTEEOF
+
+  ssh "$SSH_USER@$TARGET_HOST" 'powershell -NoProfile -Command "New-Item -ItemType Directory -Path C:\BackupCheck-staging -Force | Out-Null"' >/dev/null
+  STAGING_CREATED=1
+  scp -q "$TMPDIR/verify-password.json" "$TMPDIR/update-verify-password.ps1" \
+      "$SSH_USER@$TARGET_HOST:C:/BackupCheck-staging/"
+  ssh "$SSH_USER@$TARGET_HOST" "powershell -NoProfile -ExecutionPolicy Bypass -File C:/BackupCheck-staging/update-verify-password.ps1"
+  # staging (incl. the password) is removed by the EXIT trap, success or failure
+
+  green ""
+  green "Done. verifyPassword refreshed on $TARGET_HOST."
+  exit 0
+fi
 
 # --- 2. SSH connectivity + auto-discover AD domain / workgroup status from target ---
 cyan "Client: $CLIENT_CODE  Target: $SSH_USER@$TARGET_HOST"
@@ -424,6 +555,26 @@ NAS_PASS=""
 NAS_DEVICE=""
 fi
 
+# --- 5. Macrium image-set password(s), for the monitor's mrverify step ---
+# Lives in IT Portal as AdditionalCredentials of type Encryption, hanging off
+# the client's Macrium Configuration (type Backup, name matching
+# /macrium|reflect/i) — not on a Device, so it's a separate lookup from the
+# NAS/task credentials above. Absent entirely is normal (most clients don't
+# encrypt their images): config.json simply gets no verifyPassword key.
+cyan "Looking up Macrium image-set password(s) in IT Portal for $CLIENT_CODE..."
+VERIFY_PW_RAW=$(fetch_verify_passwords_json) || {
+  case "$VERIFY_PW_RAW" in
+    NOT_FOUND) fail "Client $CLIENT_CODE not found in IT Portal." ;;
+    *)         fail "Macrium password lookup failed: $VERIFY_PW_RAW" ;;
+  esac
+}
+VERIFY_PW_COUNT=$(printf '%s' "$VERIFY_PW_RAW" | python3 -c "import json,sys; print(len(json.load(sys.stdin)))")
+if [[ "$VERIFY_PW_COUNT" -gt 0 ]]; then
+  green "  Found $VERIFY_PW_COUNT Macrium encryption credential(s) — will be written to config.json as verifyPassword"
+else
+  cyan "  No Macrium encryption credential found for $CLIENT_CODE — config.json will have no verifyPassword"
+fi
+
 if [[ $DRY_RUN -eq 1 ]]; then
   cyan "[dry-run] Would now write config + .env, install task. Stopping."
   exit 0
@@ -443,10 +594,14 @@ cleanup() {
   fi
 }
 trap cleanup EXIT
-python3 - "$TMPDIR/config.json" "$CLIENT_CODE" "${REPOS[@]}" <<'PYEOF'
+# verify-passwords.json holds the Macrium password(s) found above (possibly
+# an empty array) — written straight to a local file, never through argv or
+# the ssh command line, same as the config/.env generation below.
+printf '%s' "$VERIFY_PW_RAW" > "$TMPDIR/verify-passwords.json"
+python3 - "$TMPDIR/config.json" "$TMPDIR/verify-passwords.json" "$CLIENT_CODE" "${REPOS[@]}" <<'PYEOF'
 import json, sys
-out, code = sys.argv[1], sys.argv[2]
-specs = sys.argv[3:]
+out, pwfile, code = sys.argv[1], sys.argv[2], sys.argv[3]
+specs = sys.argv[4:]
 # A spec is "<path>" (plain string, enumerating repository — today's
 # behaviour) or "<path>=<machine>" (object form, flat repository naming its
 # own machine). Split on the FIRST "=" only, so a machine name can't itself
@@ -471,6 +626,12 @@ config = {
   "tags": [],
   "channel": "stable"
 }
+with open(pwfile) as f:
+    pw_list = json.load(f)
+if len(pw_list) == 1:
+    config["verifyPassword"] = pw_list[0]
+elif len(pw_list) > 1:
+    config["verifyPassword"] = pw_list
 with open(out, "w") as f: json.dump(config, f, indent=2)
 PYEOF
 
