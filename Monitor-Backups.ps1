@@ -35,7 +35,7 @@
     NAS/coordinator credentials.
 
 .NOTES
-    Version: 2.6.3
+    Version: 2.6.4
     Requires: PowerShell 5.1+
 #>
 
@@ -57,7 +57,7 @@ $ErrorActionPreference = "Stop"
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
 # Script version
-$script:Version = "2.6.3"
+$script:Version = "2.6.4"
 
 # A Macrium .mrimg that was written to completion carries this ASCII marker
 # inside its last 64 bytes; a truncated copy does not. Proven on RAHR's USB
@@ -276,6 +276,45 @@ function Protect-SecretPath {
     }
     catch {
         Write-Log "Could not verify/tighten permissions on ${Path}: $_" -Level WARN -Color Yellow
+    }
+}
+
+function Reset-BroadChildAcl {
+    <#
+    .SYNOPSIS
+        Locking the install folder does not remove EXPLICIT entries on the
+        files inside it. On LTHX SRV003 (2026-09-21) Monitor-Backups.ps1 kept
+        an explicit BUILTIN\Users read entry after the folder was locked. Any
+        file directly in the folder that grants an identity other than SYSTEM,
+        Administrators or the BackupMonitor run-as account gets its explicit
+        entries dropped and goes back to inheriting from the folder. Files that
+        are already clean are left alone. Never throws.
+    #>
+    param([Parameter(Mandatory)][string]$Path)
+    try {
+        $allowed = @('S-1-5-18', 'S-1-5-32-544', [Security.Principal.WindowsIdentity]::GetCurrent().User.Value)
+        try {
+            $taskUser = (Get-ScheduledTask -TaskName 'BackupMonitor' -ErrorAction Stop).Principal.UserId
+            if ($taskUser) { $allowed += (New-Object Security.Principal.NTAccount($taskUser)).Translate([Security.Principal.SecurityIdentifier]).Value }
+        }
+        catch { }
+        foreach ($item in @(Get-ChildItem -LiteralPath $Path -Force -File -ErrorAction SilentlyContinue)) {
+            $acl = Get-Acl -LiteralPath $item.FullName
+            $broad = $false
+            foreach ($rule in $acl.Access) {
+                if ($rule.AccessControlType -ne 'Allow') { continue }
+                try { $v = $rule.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value } catch { $v = $rule.IdentityReference.Value }
+                if ($allowed -notcontains $v) { $broad = $true; break }
+            }
+            if (-not $broad) { continue }
+            $acl.SetAccessRuleProtection($false, $false)
+            foreach ($rule in @($acl.Access | Where-Object { -not $_.IsInherited })) { $acl.RemoveAccessRule($rule) | Out-Null }
+            Set-Acl -LiteralPath $item.FullName -AclObject $acl
+            Write-Log "Tightened permissions on $($item.FullName): explicit entries removed, now inherits from $Path" -Level WARN -Color Yellow
+        }
+    }
+    catch {
+        Write-Log "Could not check file permissions in ${Path}: $_" -Level WARN -Color Yellow
     }
 }
 
@@ -804,9 +843,12 @@ function Find-MrverifyExe {
         }
     }
 
-    $default = 'C:\Program Files\Macrium\Reflect\mrverify.exe'
-    if (Test-Path -LiteralPath $default -PathType Leaf -ErrorAction SilentlyContinue) {
-        return (Resolve-Path -LiteralPath $default).Path
+    # Servers that only run the Macrium Agent (no Reflect console) carry it
+    # under Agent\ - true on FP, LTHX, PR and RAHR as of 2026-09-21.
+    foreach ($default in @('C:\Program Files\Macrium\Reflect\mrverify.exe', 'C:\Program Files\Macrium\Agent\mrverify.exe')) {
+        if (Test-Path -LiteralPath $default -PathType Leaf -ErrorAction SilentlyContinue) {
+            return (Resolve-Path -LiteralPath $default).Path
+        }
     }
 
     return $null
@@ -1671,6 +1713,7 @@ Write-Log ("=" * 40) -Color Cyan
 # CTL010, 2026-09-21: C:\BackupCheck inherited Authenticated Users:Modify
 # from C:\). Children inherit the new ACL.
 Protect-SecretPath -Path $ScriptDir
+Reset-BroadChildAcl -Path $ScriptDir
 Protect-SecretPath -Path $ConfigPath
 Protect-SecretPath -Path $EnvPath
 

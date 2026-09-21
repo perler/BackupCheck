@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.6.4] - 2026-09-21
+
+### Fixed
+- `mrverify.exe` is also found under `C:\Program Files\Macrium\Agent\`. Servers that run only the
+  Macrium Agent keep it there (FP, LTHX, PR, RAHR), so 2.6.3 skipped every verify on them.
+- Files inside the install folder that still carry an explicit over-broad entry (LTHX SRV003:
+  `BUILTIN\Users` read on `Monitor-Backups.ps1`) lose those entries and inherit the locked folder ACL.
+
 ## [2.6.3] - 2026-09-21
 
 ### Security
