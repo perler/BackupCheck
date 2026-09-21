@@ -21,6 +21,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   status message. New optional config keys `deleteErrorFiles` (default `true`) and
   `errorFileMinAgeHours` (default `24`) — set `deleteErrorFiles` to `false` for the old
   detect-and-warn-only behaviour.
+- **A deleted `.error_loading` file now triggers a Macrium verify of the image set it belonged to.**
+  Interrupting a backup mid-write is exactly the situation Macrium's own `mrverify.exe` exists to
+  check, so once the leftover error file(s) for a machine are gone, the monitor derives the image
+  set's ID from the deleted file name(s) — or, if that can't be parsed, verifies the newest image
+  set on disk — and launches `mrverify.exe` against it. A verify over SMB can run for hours and the
+  monitor itself runs hourly, so it is launched **detached**: a hidden PowerShell child waits for
+  `mrverify.exe` and writes its exit code to a result file, while the monitor's own run continues
+  and finishes normally. One verify runs per machine at a time — a later run sees the previous one
+  is still going and does not start a second. Once it finishes: exit code 0 logs "verify passed" and
+  adds a note to the status message, once; exit code 1 **fails the machine's check** with "image set
+  &lt;ID&gt; failed Macrium verification, see &lt;log&gt;" — and keeps failing every run until a
+  newer image set exists, not just once. If the verify process is gone with no result (killed,
+  crashed, box rebooted mid-run) it's logged as a WARN and retried once; a second silent death gives
+  up without failing the check. `mrverify.exe` is looked up via an optional `mrverifyPath` config
+  key, then the Macrium Reflect install location in the registry, then the default
+  `C:\Program Files\Macrium\Reflect\mrverify.exe` — if none of those exist, verification is skipped
+  with a WARN and the check behaves exactly as before (v2.6.0's cleanup still runs). Password-
+  protected image sets are supported via an optional `verifyPassword` config key; the password is
+  never written to a log line or to disk — it reaches the detached verify process only through a
+  process environment variable set immediately before launch and cleared immediately after. New
+  config key `verifyAfterErrorCleanup` (default `true`) turns the whole feature off.
 
 ## [2.5.1] - 2026-09-02
 

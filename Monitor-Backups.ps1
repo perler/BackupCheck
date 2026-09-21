@@ -17,7 +17,9 @@
     member carries the Macrium end-of-file marker); a run in which no
     configured repository is reachable no longer reports the monitor healthy.
     v2.6 adds: leftover .error_loading files are deleted automatically once
-    they are old enough and no backup is running for that machine.
+    they are old enough and no backup is running for that machine; a deleted
+    error file's image set is then verified with mrverify.exe, detached, and
+    keeps the check failing until a newer image set exists if it fails.
 
 .NOTES
     Version: 2.6.0
@@ -52,6 +54,13 @@ $script:MacriumEndMarker = "__79241006_2651_11D4_"
 
 # Track connections we've made for cleanup
 $script:MountedShares = @()
+
+# Macrium image-set verification (v2.6): a password, if configured, never
+# touches disk or a log line - it travels to the detached mrverify process
+# only via this environment variable, set immediately before the process is
+# started and cleared immediately after (the child already has its own
+# inherited copy by then).
+$script:VerifyPasswordEnvVar = "BACKUPCHECK_VERIFY_PW"
 
 # Determine script directory (handles both direct execution and -File invocation)
 $ScriptDir = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Definition }
@@ -355,6 +364,7 @@ function Test-BackupHealth {
         HasErrorFiles = $false
         ErrorFileCount = 0
         DeletedErrorFileCount = 0
+        DeletedErrorFilePaths = @()
         IsWarning = $false
     }
 
@@ -400,6 +410,7 @@ function Test-BackupHealth {
         }
         if ($deletedPaths.Count -gt 0) {
             $result.DeletedErrorFileCount = $deletedPaths.Count
+            $result.DeletedErrorFilePaths = $deletedPaths
             $errorFiles = @($errorFiles | Where-Object { $deletedPaths -notcontains $_.FullName })
         }
     }
@@ -564,6 +575,469 @@ function Test-AirGapChain {
     }
 
     return $result
+}
+
+function Get-MrimgChainId {
+    <#
+    .SYNOPSIS
+        Parses the 16-hex-char Macrium image-set ID out of a .mrimg (or
+        .mrimg.error_loading<N>) file name. Returns $null if the name
+        doesn't match.
+    #>
+    param(
+        [Parameter(Mandatory)]
+        [string]$FileName
+    )
+
+    if ($FileName -match '^([0-9A-Fa-f]{16})-\d{2}-\d{2}\.mrimg(\.error_loading\d*)?$') {
+        return $Matches[1].ToUpper()
+    }
+    return $null
+}
+
+function Get-NewestChainId {
+    <#
+    .SYNOPSIS
+        Returns the image-set ID whose newest member was written most
+        recently in $Path, or $null if no chain member is found. Same
+        "newest chain" logic as Test-AirGapChain above, without the
+        base/end-marker restorability checks that function also does -
+        here we only need to pick WHICH image set to verify.
+    #>
+    param(
+        [Parameter(Mandatory)]
+        [string]$Path
+    )
+
+    $files = @(Get-ChildItem -Path $Path -Filter "*.mrimg" -Recurse -File -ErrorAction SilentlyContinue)
+    $chains = @{}
+    foreach ($f in $files) {
+        $id = Get-MrimgChainId -FileName $f.Name
+        if ($id) {
+            if (-not $chains.ContainsKey($id)) { $chains[$id] = @() }
+            $chains[$id] += $f
+        }
+    }
+    if ($chains.Count -eq 0) { return $null }
+
+    $newestId = $null
+    $newestTime = [datetime]::MinValue
+    foreach ($id in $chains.Keys) {
+        $t = ($chains[$id] | Sort-Object LastWriteTime -Descending | Select-Object -First 1).LastWriteTime
+        if ($t -gt $newestTime) { $newestTime = $t; $newestId = $id }
+    }
+    return $newestId
+}
+
+function Get-NewestBackupTime {
+    <#
+    .SYNOPSIS
+        Returns the LastWriteTime of the most recent backup file under
+        $Path (no age cutoff), or $null if none. Used to tell whether a
+        newer image set has appeared since a Macrium verify failed.
+    #>
+    param(
+        [Parameter(Mandatory)]
+        [string]$Path,
+
+        [Parameter(Mandatory)]
+        [string]$FilePattern
+    )
+
+    $files = Get-ChildItem -Path $Path -Filter $FilePattern -Recurse -File -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -notmatch '\.(error_loading\d*|tmp)$' }
+    if (-not $files) { return $null }
+    return ($files | Sort-Object LastWriteTime -Descending | Select-Object -First 1).LastWriteTime
+}
+
+function Find-MrverifyExe {
+    <#
+    .SYNOPSIS
+        Locates mrverify.exe: a configured path, then the Macrium Reflect
+        install directory (via the standard Uninstall registry entry),
+        then the default install path. Returns $null - never throws - if
+        none is found, so a missing tool only ever produces a WARN.
+    .NOTES
+        mrverify.exe is a separate download from Macrium
+        (updates.macrium.com/reflect/utilities/mrverify.exe), not part of
+        the Reflect installer - on a given client it may simply not be on
+        disk anywhere, in which case this always falls through to $null.
+    #>
+    param(
+        [Parameter()]
+        [string]$ConfiguredPath
+    )
+
+    if ($ConfiguredPath -and (Test-Path -LiteralPath $ConfiguredPath -PathType Leaf -ErrorAction SilentlyContinue)) {
+        return (Resolve-Path -LiteralPath $ConfiguredPath).Path
+    }
+
+    $uninstallRoots = @(
+        'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
+        'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*'
+    )
+    foreach ($root in $uninstallRoots) {
+        try {
+            $entries = Get-ItemProperty -Path $root -ErrorAction SilentlyContinue |
+                Where-Object { $_.DisplayName -like '*Macrium*Reflect*' -and $_.InstallLocation }
+            foreach ($entry in $entries) {
+                $candidate = Join-Path $entry.InstallLocation 'mrverify.exe'
+                if (Test-Path -LiteralPath $candidate -PathType Leaf -ErrorAction SilentlyContinue) {
+                    return (Resolve-Path -LiteralPath $candidate).Path
+                }
+            }
+        }
+        catch {
+            # Registry provider unavailable (e.g. not Windows) - fall through.
+        }
+    }
+
+    $default = 'C:\Program Files\Macrium\Reflect\mrverify.exe'
+    if (Test-Path -LiteralPath $default -PathType Leaf -ErrorAction SilentlyContinue) {
+        return (Resolve-Path -LiteralPath $default).Path
+    }
+
+    return $null
+}
+
+function New-VerifyChildCommand {
+    <#
+    .SYNOPSIS
+        Builds the PowerShell source for the detached child process that
+        runs mrverify.exe synchronously and writes its exit code to disk.
+    .DESCRIPTION
+        The Macrium image password (if any) is NOT embedded in this text -
+        the child reads it back out of $env:BACKUPCHECK_VERIFY_PW, which it
+        inherits from the parent at launch (see Start-ImageSetVerify). That
+        keeps the password out of this generated script and out of every
+        Write-Log line; it still appears as an mrverify.exe process argument
+        on the box, which is inherent to mrverify's own command-line-only
+        interface (confirmed against Macrium's own KB page).
+    #>
+    param(
+        [Parameter(Mandatory)]
+        [string]$MrverifyPath,
+
+        [Parameter(Mandatory)]
+        [string]$TargetPattern,
+
+        [Parameter()]
+        [bool]$Recurse = $true,
+
+        [Parameter()]
+        [bool]$UsePassword = $false,
+
+        [Parameter(Mandatory)]
+        [string]$LogPath,
+
+        [Parameter(Mandatory)]
+        [string]$ResultPath
+    )
+
+    $mrverifyEsc = $MrverifyPath.Replace("'", "''")
+    $targetEsc = $TargetPattern.Replace("'", "''")
+    $logEsc = $LogPath.Replace("'", "''")
+    $resultEsc = $ResultPath.Replace("'", "''")
+
+    $argLines = @("'$targetEsc'")
+    if ($UsePassword) { $argLines += "'-p'", "`$env:$script:VerifyPasswordEnvVar" }
+    if ($Recurse) { $argLines += "'-r'" }
+    $argLines += "'-l'", "'$logEsc'"
+    $argListText = $argLines -join ', '
+
+    return @"
+`$ErrorActionPreference = 'Continue'
+`$exitCode = -1
+try {
+    `$mrArgs = @($argListText)
+    `$p = Start-Process -FilePath '$mrverifyEsc' -ArgumentList `$mrArgs -NoNewWindow -Wait -PassThru
+    `$exitCode = `$p.ExitCode
+}
+catch {
+    `$exitCode = -1
+}
+finally {
+    if (Test-Path Env:\$script:VerifyPasswordEnvVar) { Remove-Item Env:\$script:VerifyPasswordEnvVar -ErrorAction SilentlyContinue }
+}
+@{ exitCode = `$exitCode; finishedAt = (Get-Date).ToString('o') } | ConvertTo-Json | Out-File -FilePath '$resultEsc' -Encoding UTF8 -Force
+"@
+}
+
+function Start-ImageSetVerify {
+    <#
+    .SYNOPSIS
+        Launches mrverify.exe DETACHED (fire-and-forget) via a small hidden
+        PowerShell child that waits for it and writes the exit code to
+        $ResultPath. Returns immediately with the child's PID and start
+        time - a verify over SMB can run for hours and the monitor itself
+        runs hourly, so nothing here waits for it to finish.
+    #>
+    param(
+        [Parameter(Mandatory)]
+        [string]$MrverifyPath,
+
+        [Parameter(Mandatory)]
+        [string]$TargetPattern,
+
+        [Parameter()]
+        [bool]$Recurse = $true,
+
+        [Parameter()]
+        [string]$Password,
+
+        [Parameter(Mandatory)]
+        [string]$LogPath,
+
+        [Parameter(Mandatory)]
+        [string]$ResultPath,
+
+        [Parameter()]
+        [string]$ShellExe = 'powershell.exe'
+    )
+
+    $usePassword = [bool]$Password
+    $childScript = New-VerifyChildCommand -MrverifyPath $MrverifyPath -TargetPattern $TargetPattern `
+        -Recurse $Recurse -UsePassword $usePassword -LogPath $LogPath -ResultPath $ResultPath
+
+    $bytes = [Text.Encoding]::Unicode.GetBytes($childScript)
+    $encoded = [Convert]::ToBase64String($bytes)
+    $procArgs = @("-NoProfile", "-NonInteractive", "-EncodedCommand", $encoded)
+
+    if ($usePassword) { Set-Item -Path "Env:$script:VerifyPasswordEnvVar" -Value $Password }
+    try {
+        $startArgs = @{
+            FilePath = $ShellExe
+            ArgumentList = $procArgs
+            PassThru = $true
+        }
+        # $IsWindows doesn't exist on Windows PowerShell 5.1 (the production
+        # target, Windows-only by definition); on pwsh it's $true on Windows
+        # and $false elsewhere. -ne $false covers "true" and "undefined" the
+        # same way, so WindowStyle is only skipped on a real non-Windows pwsh.
+        if ($IsWindows -ne $false) { $startArgs.WindowStyle = 'Hidden' }
+        $proc = Start-Process @startArgs
+    }
+    finally {
+        if ($usePassword) { Remove-Item "Env:$script:VerifyPasswordEnvVar" -ErrorAction SilentlyContinue }
+    }
+
+    return @{ Pid = $proc.Id; StartTime = $proc.StartTime }
+}
+
+function Update-ImageSetVerify {
+    <#
+    .SYNOPSIS
+        Per-machine state machine for the "verify after error-file cleanup"
+        feature. Call once per machine per run; reads/writes one state file
+        per machine in $StateDir.
+    .DESCRIPTION
+        - No state, no deletions this run: no-op.
+        - No state, deletions this run: derive the image set from the
+          deleted file names (or the newest chain if that fails) and
+          launch a verify.
+        - State exists, process still alive: no-op (no second launch).
+        - State exists, process dead, result says exit 0: report
+          JustPassed once, clear the state.
+        - State exists, process dead, result says exit 1: report
+          ForceFail, and KEEP the state (so it forces a fail every run)
+          until a newer backup than the one that failed appears.
+        - State exists, process dead, no result file: WARN and retry once;
+          if the retry also dies without a result, give up and clear it.
+    .OUTPUTS
+        @{ ForceFail; FailMessage; JustPassed; ImageId }
+    #>
+    param(
+        [Parameter(Mandatory)]
+        [string]$StateDir,
+
+        [Parameter(Mandatory)]
+        [string]$Slug,
+
+        [Parameter(Mandatory)]
+        [string]$MachineName,
+
+        [Parameter(Mandatory)]
+        [string]$MachinePath,
+
+        [Parameter()]
+        [string[]]$DeletedErrorFilePaths = @(),
+
+        [Parameter(Mandatory)]
+        [string]$FilePattern,
+
+        [Parameter()]
+        [string]$MrverifyPath,
+
+        [Parameter()]
+        [string]$VerifyPassword,
+
+        [Parameter()]
+        [bool]$Recurse = $true,
+
+        [Parameter()]
+        [string]$ShellExe = 'powershell.exe'
+    )
+
+    $statePath = Join-Path $StateDir "$Slug.json"
+    $verify = @{ ForceFail = $false; FailMessage = ''; JustPassed = $false; ImageId = $null }
+
+    $state = $null
+    if (Test-Path -LiteralPath $statePath) {
+        try { $state = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json } catch { $state = $null }
+    }
+
+    if ($state) {
+        $alive = $false
+        try {
+            $proc = Get-Process -Id $state.pid -ErrorAction Stop
+            if ($state.startTime) {
+                $recorded = [datetime]$state.startTime
+                # PIDs can be reused by the OS; comparing the recorded start
+                # time against the live process's own start time catches
+                # that instead of trusting a bare PID match.
+                if ([math]::Abs(($proc.StartTime - $recorded).TotalSeconds) -le 2) { $alive = $true }
+            }
+            else {
+                $alive = $true
+            }
+        }
+        catch { $alive = $false }
+
+        if ($alive) {
+            Write-Log "  Macrium verify still running for ${MachineName} (image set $($state.imageId), PID $($state.pid), started $($state.startTime))" -Level INFO
+            $verify.ImageId = $state.imageId
+            return $verify
+        }
+
+        # Process is not alive any more - look for a result.
+        if (Test-Path -LiteralPath $state.resultPath) {
+            $result = $null
+            try { $result = Get-Content -LiteralPath $state.resultPath -Raw | ConvertFrom-Json } catch { $result = $null }
+
+            if ($result -and ($result.PSObject.Properties.Name -contains 'exitCode')) {
+                if ([int]$result.exitCode -eq 0) {
+                    Write-Log "  Macrium verify PASSED for ${MachineName} (image set $($state.imageId)): $($state.logPath)" -Level OK -Color Green
+                    $verify.JustPassed = $true
+                    $verify.ImageId = $state.imageId
+                    Remove-Item -LiteralPath $statePath -Force -ErrorAction SilentlyContinue
+                    Remove-Item -LiteralPath $state.resultPath -Force -ErrorAction SilentlyContinue
+                    $state = $null
+                }
+                else {
+                    $newest = Get-NewestBackupTime -Path $MachinePath -FilePattern $FilePattern
+                    $failedAt = if ($state.newestMemberTime) { [datetime]$state.newestMemberTime } else { [datetime]::MinValue }
+                    if ($newest -and $newest -gt $failedAt) {
+                        Write-Log "  Macrium verify failure for ${MachineName} (image set $($state.imageId)) cleared - a newer backup exists" -Level INFO
+                        Remove-Item -LiteralPath $statePath -Force -ErrorAction SilentlyContinue
+                        Remove-Item -LiteralPath $state.resultPath -Force -ErrorAction SilentlyContinue
+                        $state = $null
+                    }
+                    else {
+                        $verify.ForceFail = $true
+                        $verify.ImageId = $state.imageId
+                        $verify.FailMessage = "image set $($state.imageId) failed Macrium verification, see $($state.logPath)"
+                        return $verify
+                    }
+                }
+            }
+            else {
+                # Malformed/unreadable result file - treat like dead-without-result below.
+                Remove-Item -LiteralPath $state.resultPath -Force -ErrorAction SilentlyContinue
+            }
+        }
+
+        if ($state -and -not (Test-Path -LiteralPath $state.resultPath)) {
+            # Dead without a usable result file.
+            if ($state.retried) {
+                Write-Log "  Macrium verify for ${MachineName} (image set $($state.imageId)) is gone with no result after one retry - giving up" -Level WARN -Color Yellow
+                Remove-Item -LiteralPath $statePath -Force -ErrorAction SilentlyContinue
+                $state = $null
+            }
+            else {
+                Write-Log "  Macrium verify for ${MachineName} (image set $($state.imageId), PID $($state.pid)) is gone with no result - retrying once" -Level WARN -Color Yellow
+                if ($MrverifyPath) {
+                    $target = Join-Path $MachinePath "$($state.imageId)-*.mrimg"
+                    $launch = Start-ImageSetVerify -MrverifyPath $MrverifyPath -TargetPattern $target -Recurse $Recurse `
+                        -Password $VerifyPassword -LogPath $state.logPath -ResultPath $state.resultPath -ShellExe $ShellExe
+                    $newState = @{
+                        imageId = $state.imageId
+                        machineName = $MachineName
+                        targetPattern = $target
+                        startTime = $launch.StartTime.ToString('o')
+                        pid = $launch.Pid
+                        logPath = $state.logPath
+                        resultPath = $state.resultPath
+                        newestMemberTime = $state.newestMemberTime
+                        retried = $true
+                    }
+                    $newState | ConvertTo-Json | Out-File -FilePath $statePath -Encoding UTF8 -Force
+                }
+                else {
+                    Remove-Item -LiteralPath $statePath -Force -ErrorAction SilentlyContinue
+                }
+                $verify.ImageId = $state.imageId
+                return $verify
+            }
+        }
+    }
+
+    # No pending/persisting state (never existed, or just cleared above).
+    if ($DeletedErrorFilePaths -and $DeletedErrorFilePaths.Count -gt 0) {
+        if (-not $MrverifyPath) {
+            Write-Log "  Verify skipped for ${MachineName}: mrverify.exe not found" -Level WARN -Color Yellow
+            return $verify
+        }
+
+        $ids = @($DeletedErrorFilePaths | ForEach-Object { Get-MrimgChainId -FileName (Split-Path $_ -Leaf) } |
+            Where-Object { $_ } | Select-Object -Unique)
+
+        $imageId = $null
+        if ($ids.Count -eq 1) {
+            $imageId = $ids[0]
+        }
+        elseif ($ids.Count -gt 1) {
+            # Deletions from more than one image set in the same run - verify
+            # the newest of the affected sets rather than launching several.
+            $imageId = $ids | Sort-Object { Get-NewestBackupTime -Path $MachinePath -FilePattern "$_*.mrimg" } -Descending | Select-Object -First 1
+        }
+        else {
+            # Couldn't parse an ID from any deleted file name - fall back to
+            # the newest chain on disk (same logic Test-AirGapChain uses).
+            $imageId = Get-NewestChainId -Path $MachinePath
+        }
+
+        if (-not $imageId) {
+            Write-Log "  Verify skipped for ${MachineName}: could not determine an image set to verify" -Level WARN -Color Yellow
+            return $verify
+        }
+
+        $target = Join-Path $MachinePath "$imageId-*.mrimg"
+        $logPath = Join-Path $StateDir "$Slug.mrverify.log"
+        $resultPath = Join-Path $StateDir "$Slug.result.json"
+        Remove-Item -LiteralPath $resultPath -Force -ErrorAction SilentlyContinue
+
+        $newestMemberTime = Get-NewestBackupTime -Path $MachinePath -FilePattern "$imageId-*.mrimg"
+
+        $launch = Start-ImageSetVerify -MrverifyPath $MrverifyPath -TargetPattern $target -Recurse $Recurse `
+            -Password $VerifyPassword -LogPath $logPath -ResultPath $resultPath -ShellExe $ShellExe
+
+        $newState = @{
+            imageId = $imageId
+            machineName = $MachineName
+            targetPattern = $target
+            startTime = $launch.StartTime.ToString('o')
+            pid = $launch.Pid
+            logPath = $logPath
+            resultPath = $resultPath
+            newestMemberTime = if ($newestMemberTime) { $newestMemberTime.ToString('o') } else { $null }
+            retried = $false
+        }
+        $newState | ConvertTo-Json | Out-File -FilePath $statePath -Encoding UTF8 -Force
+        Write-Log "  Started Macrium verify for ${MachineName}: image set $imageId (PID $($launch.Pid), log $logPath)" -Level INFO
+        $verify.ImageId = $imageId
+    }
+
+    return $verify
 }
 
 function Get-DeviceTypeSettings {
@@ -1078,6 +1552,28 @@ Write-Log "Max backup age: $($config.backupMaxAgeHours) hours"
 $deleteErrorFiles = if ($config.PSObject.Properties.Name -contains 'deleteErrorFiles') { [bool]$config.deleteErrorFiles } else { $true }
 $errorFileMinAgeHours = if ($config.PSObject.Properties.Name -contains 'errorFileMinAgeHours') { [int]$config.errorFileMinAgeHours } else { 24 }
 
+# Macrium verify after error-file cleanup: also optional, also on by
+# default. mrverifyPath/verifyPassword are optional site-specific settings;
+# see Find-MrverifyExe and Update-ImageSetVerify above.
+$verifyAfterErrorCleanup = if ($config.PSObject.Properties.Name -contains 'verifyAfterErrorCleanup') { [bool]$config.verifyAfterErrorCleanup } else { $true }
+$configuredMrverifyPath = if ($config.PSObject.Properties.Name -contains 'mrverifyPath') { [string]$config.mrverifyPath } else { $null }
+$verifyPassword = if ($config.PSObject.Properties.Name -contains 'verifyPassword') { [string]$config.verifyPassword } else { $null }
+
+$script:VerifyStateDir = Join-Path $ScriptDir ".verify-state"
+$mrverifyPath = $null
+if ($verifyAfterErrorCleanup) {
+    if (-not (Test-Path $script:VerifyStateDir)) {
+        try { New-Item -ItemType Directory -Path $script:VerifyStateDir -Force | Out-Null } catch { }
+    }
+    $mrverifyPath = Find-MrverifyExe -ConfiguredPath $configuredMrverifyPath
+    if ($mrverifyPath) {
+        Write-Log "Macrium verify tool: $mrverifyPath"
+    }
+    else {
+        Write-Log "verify skipped: mrverify.exe not found" -Level WARN -Color Yellow
+    }
+}
+
 # Build tags list: automatic tags + custom tags from config
 $tags = @("backup", "macrium", $config.companyId.ToLower())
 if ($config.tags -and $config.tags.Count -gt 0) {
@@ -1200,6 +1696,18 @@ foreach ($repo in $repositories) {
             continue
         }
 
+        # Macrium verify after error-file cleanup (v2.6.0): a deleted
+        # .error_loading file means a backup was interrupted, so the image
+        # set it belonged to gets verified. State survives across runs -
+        # a verify over SMB can take hours and the monitor runs hourly.
+        # See Update-ImageSetVerify above for the full state machine.
+        $verify = @{ ForceFail = $false; FailMessage = ''; JustPassed = $false; ImageId = $null }
+        if ($verifyAfterErrorCleanup) {
+            $verify = Update-ImageSetVerify -StateDir $script:VerifyStateDir -Slug $slug -MachineName $health.MachineName `
+                -MachinePath $machine.Path -DeletedErrorFilePaths $health.DeletedErrorFilePaths `
+                -FilePattern $config.backupFilePattern -MrverifyPath $mrverifyPath -VerifyPassword $verifyPassword
+        }
+
         # Build status message. Corruption and staleness are independent
         # conditions, so report both. Previously corruption short-circuited the
         # message and a genuine backup stoppage was indistinguishable from a
@@ -1225,7 +1733,20 @@ foreach ($repo in $repositories) {
             $statusDetail = "removed $($health.DeletedErrorFileCount) leftover .error_loading file(s); $statusDetail"
         }
 
-        if ($health.HasErrorFiles -and -not $health.IsFresh) {
+        if ($verify.JustPassed) {
+            $statusDetail = "$statusDetail; Macrium verify passed for image set $($verify.ImageId)"
+        }
+
+        if ($verify.ForceFail) {
+            # A past image set is known not to be restorable. This overrides
+            # every other verdict below, including a fresh/uncorrupted backup:
+            # a fresh backup that fails verification still isn't one we can
+            # promise a restore from.
+            Write-Log "  [ERR]  $($health.MachineName): $($verify.FailMessage)" -Level FAIL -Color Magenta
+            $failCount++
+            $statusDetail = "$($verify.FailMessage); $statusDetail"
+        }
+        elseif ($health.HasErrorFiles -and -not $health.IsFresh) {
             # Corrupt AND nothing fresh - the case the corruption check exists
             # for. Fails for every device type; the stale-workstation tolerance
             # below deliberately does not apply here.
@@ -1264,7 +1785,7 @@ foreach ($repo in $repositories) {
         $results += @{
             MachineName = $health.MachineName
             Slug = $slug
-            IsHealthy = $health.IsHealthy
+            IsHealthy = if ($verify.ForceFail) { $false } else { $health.IsHealthy }
             IsSkipped = $health.IsSkipped
             BackupAge = $health.BackupAge
             BackupCount = $health.BackupCount
