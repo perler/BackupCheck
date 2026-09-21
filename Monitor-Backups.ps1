@@ -35,7 +35,7 @@
     NAS/coordinator credentials.
 
 .NOTES
-    Version: 2.6.2
+    Version: 2.6.3
     Requires: PowerShell 5.1+
 #>
 
@@ -57,7 +57,7 @@ $ErrorActionPreference = "Stop"
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
 # Script version
-$script:Version = "2.6.2"
+$script:Version = "2.6.3"
 
 # A Macrium .mrimg that was written to completion carries this ASCII marker
 # inside its last 64 bytes; a truncated copy does not. Proven on RAHR's USB
@@ -210,8 +210,20 @@ function Protect-SecretPath {
     try {
         $systemSid = New-Object Security.Principal.SecurityIdentifier('S-1-5-18')      # NT AUTHORITY\SYSTEM
         $adminsSid = New-Object Security.Principal.SecurityIdentifier('S-1-5-32-544')  # BUILTIN\Administrators
+        # The third identity is the BackupMonitor task's run-as account, not
+        # whoever runs the script right now: a manual run by another admin
+        # must not lock the task account out of its own folder.
         $currentIdentity = [Security.Principal.WindowsIdentity]::GetCurrent()
         $currentSid = $currentIdentity.User
+        $runAsName = $currentIdentity.Name
+        try {
+            $taskUser = (Get-ScheduledTask -TaskName 'BackupMonitor' -ErrorAction Stop).Principal.UserId
+            if ($taskUser) {
+                $currentSid = (New-Object Security.Principal.NTAccount($taskUser)).Translate([Security.Principal.SecurityIdentifier])
+                $runAsName = $taskUser
+            }
+        }
+        catch { }
 
         # Dedupe by SID value (the running account may itself BE SYSTEM or a
         # member of Administrators, e.g. during a manual admin-console run).
@@ -260,7 +272,7 @@ function Protect-SecretPath {
         }
 
         Set-Acl -LiteralPath $Path -AclObject $acl
-        Write-Log "Tightened permissions on ${Path}: now SYSTEM, BUILTIN\Administrators and $($currentIdentity.Name) only" -Level WARN -Color Yellow
+        Write-Log "Tightened permissions on ${Path}: now SYSTEM, BUILTIN\Administrators and $runAsName only" -Level WARN -Color Yellow
     }
     catch {
         Write-Log "Could not verify/tighten permissions on ${Path}: $_" -Level WARN -Color Yellow
@@ -1654,6 +1666,11 @@ Write-Log ("=" * 40) -Color Cyan
 # Lock down anything on disk that can hold a secret before reading it -
 # config.json can hold verifyPassword, .env holds NAS/coordinator
 # credentials. See Protect-SecretPath above.
+# The whole install folder first: Monitor-Backups.ps1 runs elevated every
+# hour, so a script any user can edit is a way to become admin (found on NM
+# CTL010, 2026-09-21: C:\BackupCheck inherited Authenticated Users:Modify
+# from C:\). Children inherit the new ACL.
+Protect-SecretPath -Path $ScriptDir
 Protect-SecretPath -Path $ConfigPath
 Protect-SecretPath -Path $EnvPath
 

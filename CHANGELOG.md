@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.6.3] - 2026-09-21
+
+### Security
+- **The whole install folder is now locked down, not just the secret files.** On NM CTL010,
+  `C:\BackupCheck` inherited `Authenticated Users: Modify` from `C:\`, so any signed-in user
+  could edit `Monitor-Backups.ps1`, which runs elevated every hour. The monitor now sets the folder
+  to SYSTEM, Administrators and the BackupMonitor task's run-as account at the start of each run,
+  and the files inherit that. The third identity is the task's account rather than whoever runs
+  the script, so a manual run by another admin cannot lock the task out of its own folder.
+
 ## [2.6.2] - 2026-09-21
 
 ### Added
