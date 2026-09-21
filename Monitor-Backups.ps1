@@ -180,6 +180,93 @@ function Get-EnvFile {
     return $env
 }
 
+function Protect-SecretPath {
+    <#
+    .SYNOPSIS
+        Locks a file or directory that may hold a secret (config.json, .env,
+        the .verify-state directory) down to SYSTEM, BUILTIN\Administrators
+        and the account this script is currently running as, removing any
+        other grant and any inherited rule.
+    .DESCRIPTION
+        config.json can carry verifyPassword and .env carries NAS/coordinator
+        credentials; .verify-state holds per-machine Macrium-verify state
+        next to them. Called once per run for each of those paths. A path
+        that already grants access to nobody but the three allowed
+        identities is left completely alone and nothing is logged - this
+        only logs, once, when it actually had to fix something. SIDs are
+        used throughout, never names, because these servers can be
+        German-language Windows, where the built-in group names differ
+        (BUILTIN\Benutzer, not BUILTIN\Users). Any failure here (unsupported
+        filesystem, an account with no right to change ACLs) is a WARN and
+        never stops the run.
+    #>
+    param(
+        [Parameter(Mandatory)]
+        [string]$Path
+    )
+
+    if (-not (Test-Path -LiteralPath $Path)) { return }
+
+    try {
+        $systemSid = New-Object Security.Principal.SecurityIdentifier('S-1-5-18')      # NT AUTHORITY\SYSTEM
+        $adminsSid = New-Object Security.Principal.SecurityIdentifier('S-1-5-32-544')  # BUILTIN\Administrators
+        $currentIdentity = [Security.Principal.WindowsIdentity]::GetCurrent()
+        $currentSid = $currentIdentity.User
+
+        # Dedupe by SID value (the running account may itself BE SYSTEM or a
+        # member of Administrators, e.g. during a manual admin-console run).
+        $uniqueSids = @()
+        $seenValues = @{}
+        foreach ($sid in @($systemSid, $adminsSid, $currentSid)) {
+            if (-not $seenValues.ContainsKey($sid.Value)) {
+                $uniqueSids += $sid
+                $seenValues[$sid.Value] = $true
+            }
+        }
+        $allowedValues = @($uniqueSids | ForEach-Object { $_.Value })
+
+        $acl = Get-Acl -LiteralPath $Path
+
+        $tooBroad = $false
+        foreach ($rule in $acl.Access) {
+            if ($rule.AccessControlType -ne 'Allow') { continue }
+            try { $sidValue = $rule.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value }
+            catch { $sidValue = $rule.IdentityReference.Value }
+            if ($allowedValues -notcontains $sidValue) { $tooBroad = $true; break }
+        }
+        $isInherited = [bool]($acl.Access | Where-Object { $_.IsInherited })
+
+        if (-not $tooBroad -and -not $isInherited) { return }
+
+        $isContainer = (Get-Item -LiteralPath $Path).PSIsContainer
+        $inheritance = if ($isContainer) {
+            [Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [Security.AccessControl.InheritanceFlags]::ObjectInherit
+        }
+        else {
+            [Security.AccessControl.InheritanceFlags]::None
+        }
+        $propagation = [Security.AccessControl.PropagationFlags]::None
+
+        # Disable inheritance and drop every inherited rule (preserveInheritance:
+        # $false), then strip whatever explicit rules are left before adding
+        # back exactly the three we allow.
+        $acl.SetAccessRuleProtection($true, $false)
+        foreach ($rule in @($acl.Access)) {
+            $acl.RemoveAccessRule($rule) | Out-Null
+        }
+        foreach ($sid in $uniqueSids) {
+            $rule = New-Object Security.AccessControl.FileSystemAccessRule($sid, 'FullControl', $inheritance, $propagation, 'Allow')
+            $acl.AddAccessRule($rule)
+        }
+
+        Set-Acl -LiteralPath $Path -AclObject $acl
+        Write-Log "Tightened permissions on ${Path}: now SYSTEM, BUILTIN\Administrators and $($currentIdentity.Name) only" -Level WARN -Color Yellow
+    }
+    catch {
+        Write-Log "Could not verify/tighten permissions on ${Path}: $_" -Level WARN -Color Yellow
+    }
+}
+
 function Connect-ShareWithCredentials {
     <#
     .SYNOPSIS
@@ -1564,6 +1651,12 @@ Invoke-LogRotation
 Write-Log "BackupCheck Monitor v$($script:Version)" -Color Cyan
 Write-Log ("=" * 40) -Color Cyan
 
+# Lock down anything on disk that can hold a secret before reading it -
+# config.json can hold verifyPassword, .env holds NAS/coordinator
+# credentials. See Protect-SecretPath above.
+Protect-SecretPath -Path $ConfigPath
+Protect-SecretPath -Path $EnvPath
+
 # Load configuration
 Write-Log "Loading configuration..."
 if (-not (Test-Path $ConfigPath)) {
@@ -1654,6 +1747,7 @@ if ($verifyAfterErrorCleanup) {
     if (-not (Test-Path $script:VerifyStateDir)) {
         try { New-Item -ItemType Directory -Path $script:VerifyStateDir -Force | Out-Null } catch { }
     }
+    Protect-SecretPath -Path $script:VerifyStateDir
     $mrverifyPath = Find-MrverifyExe -ConfiguredPath $configuredMrverifyPath
     if ($mrverifyPath) {
         Write-Log "Macrium verify tool: $mrverifyPath"
