@@ -27,7 +27,7 @@
     skipping them, unchanged, when there's no coordinator to make that call).
 
 .NOTES
-    Version: 2.6.0
+    Version: 2.6.1
     Requires: PowerShell 5.1+
 #>
 
@@ -49,7 +49,7 @@ $ErrorActionPreference = "Stop"
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
 # Script version
-$script:Version = "2.6.0"
+$script:Version = "2.6.1"
 
 # A Macrium .mrimg that was written to completion carries this ASCII marker
 # inside its last 64 bytes; a truncated copy does not. Proven on RAHR's USB
@@ -829,6 +829,17 @@ function Start-ImageSetVerify {
     return @{ Pid = $proc.Id; StartTime = $proc.StartTime }
 }
 
+function Test-VerifyPasswordOnly {
+    # True when mrverify's log has failure lines and every one of them is a
+    # "Password Error" (seen on NM, 2026-09-21: an encrypted image set
+    # verified without verifyPassword fails every file this way).
+    param([string]$LogPath)
+    if (-not $LogPath -or -not (Test-Path -LiteralPath $LogPath)) { return $false }
+    $failures = @(Get-Content -LiteralPath $LogPath -ErrorAction SilentlyContinue | Where-Object { $_ -match '^\s*failure\s' })
+    if ($failures.Count -eq 0) { return $false }
+    return (@($failures | Where-Object { $_ -notmatch 'Password Error\s*$' }).Count -eq 0)
+}
+
 function Update-ImageSetVerify {
     <#
     .SYNOPSIS
@@ -924,6 +935,15 @@ function Update-ImageSetVerify {
                     Write-Log "  Macrium verify PASSED for ${MachineName} (image set $($state.imageId)): $($state.logPath)" -Level OK -Color Green
                     $verify.JustPassed = $true
                     $verify.ImageId = $state.imageId
+                    Remove-Item -LiteralPath $statePath -Force -ErrorAction SilentlyContinue
+                    Remove-Item -LiteralPath $state.resultPath -Force -ErrorAction SilentlyContinue
+                    $state = $null
+                }
+                elseif (Test-VerifyPasswordOnly -LogPath $state.logPath) {
+                    # Every failure is "Password Error": the images are
+                    # encrypted and no (or a wrong) verifyPassword is set.
+                    # That says nothing about the images, so never fail on it.
+                    Write-Log "  Macrium verify for ${MachineName} (image set $($state.imageId)) could not run: images are password-protected, set verifyPassword in config.json ($($state.logPath))" -Level WARN -Color Yellow
                     Remove-Item -LiteralPath $statePath -Force -ErrorAction SilentlyContinue
                     Remove-Item -LiteralPath $state.resultPath -Force -ErrorAction SilentlyContinue
                     $state = $null

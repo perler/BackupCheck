@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.6.1] - 2026-09-21
+
+### Fixed
+- **A verify of password-protected images no longer fails the check.** Without `verifyPassword`,
+  `mrverify.exe` reports every file of an encrypted image set as "Password Error" and exits 1.
+  2.6.0 counted that as a failed verify and would have kept the check DOWN until a newer backup
+  appeared. When every failure line is a password error, the monitor now logs a WARN telling you
+  to set `verifyPassword` and does not fail. Found on the first canary run (NM, 2026-09-21).
+- Stale machines with non-standard names keep the plain v2.2.4 skip. The coordinator's
+  online-hours budget only exists for wks/nb, so it would have failed them straight away.
+
 ## [2.6.0] - 2026-09-21
 
 ### Added
