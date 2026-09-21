@@ -188,6 +188,14 @@ For workstations and notebooks that are legitimately offline (weekends, holidays
 
 This will be replaced by the coordinator API in v2.1.
 
+When a coordinator is configured (see `.env.example`), it makes this decision directly instead: a
+stale workstation/notebook is now reported to it as unhealthy, and it weighs Atera's online/offline
+state (and, if online, an online-hours budget) before deciding whether to ping `/fail` — so an
+offline notebook no longer simply runs out its healthchecks.io period while switched off. Without a
+coordinator (or if it can't be reached), these stale results are **not** sent to healthchecks.io at
+all, exactly as before v2.6.0; the check's own Period + grace is what raises the alarm if backups
+genuinely stop.
+
 ## Troubleshooting
 
 ### Checks not appearing

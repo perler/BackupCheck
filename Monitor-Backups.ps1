@@ -19,7 +19,12 @@
     v2.6 adds: leftover .error_loading files are deleted automatically once
     they are old enough and no backup is running for that machine; a deleted
     error file's image set is then verified with mrverify.exe, detached, and
-    keeps the check failing until a newer image set exists if it fails.
+    keeps the check failing until a newer image set exists if it fails;
+    stale-but-intact workstations/notebooks are now reported to the
+    coordinator instead of silently skipped, so it can weigh Atera's
+    online/offline state instead of them running out their own HC period
+    while switched off (the direct-to-healthchecks.io fallback keeps
+    skipping them, unchanged, when there's no coordinator to make that call).
 
 .NOTES
     Version: 2.6.0
@@ -1737,6 +1742,13 @@ foreach ($repo in $repositories) {
             $statusDetail = "$statusDetail; Macrium verify passed for image set $($verify.ImageId)"
         }
 
+        # IsStale marks the "no backup within threshold, but not corrupt,
+        # not a server" case below - the one the v2.2.4 direct-ping skip
+        # exists for. It's still added to $results so the coordinator can
+        # judge it against Atera's online state; only the direct-to-HC
+        # fallback (no coordinator) needs to keep skipping it - see Phase 2.
+        $isStale = $false
+
         if ($verify.ForceFail) {
             # A past image set is known not to be restorable. This overrides
             # every other verdict below, including a fresh/uncorrupted backup:
@@ -1766,19 +1778,24 @@ foreach ($repo in $repositories) {
             # backups are not corrupt. Servers are expected to back up daily and
             # are latency-critical, so keep the explicit failure ping for them.
             # Workstations/notebooks (and non-standard names) legitimately go days
-            # between images; an explicit /fail here flips the HC check DOWN
-            # immediately and defeats the check's own Period tolerance
-            # (wks 4d / nb 8d + grace), flooding alerts. Skip instead and let the
-            # HC Period+grace raise the alarm if backups genuinely stop.
+            # between images. Reported as unhealthy below so the coordinator can
+            # weigh Atera's online/offline state (and, if online, an online-hours
+            # budget) instead of the raw HC period - a machine switched off for
+            # longer than its own HC period (nb 8d / wks 4d + grace) previously
+            # alerted DOWN on elapsed calendar time alone, having missed nothing
+            # (PR NB005, RAHR NB007, 2026-09-20). Without a coordinator, sending
+            # an explicit /fail here still flips the HC check DOWN immediately
+            # and defeats the check's own Period tolerance, flooding alerts - so
+            # the direct-ping fallback in Phase 2 filters these back out.
             $devType = (Get-DeviceTypeSettings -MachineName $health.MachineName).Tag
             if ($devType -eq 'srv') {
                 Write-Log "  [FAIL] $($health.MachineName): $statusDetail" -Level FAIL -Color Red
                 $failCount++
             }
             else {
-                Write-Log "  [SKIP] $($health.MachineName): $statusDetail (stale; deferring to HC period)" -Level SKIP -Color DarkGray
+                Write-Log "  [SKIP] $($health.MachineName): $statusDetail (stale; deferring to HC period/coordinator)" -Level SKIP -Color DarkGray
                 $skipCount++
-                continue
+                $isStale = $true
             }
         }
 
@@ -1786,6 +1803,7 @@ foreach ($repo in $repositories) {
             MachineName = $health.MachineName
             Slug = $slug
             IsHealthy = if ($verify.ForceFail) { $false } else { $health.IsHealthy }
+            IsStale = $isStale
             IsSkipped = $health.IsSkipped
             BackupAge = $health.BackupAge
             BackupCount = $health.BackupCount
@@ -1858,7 +1876,19 @@ if ($useDirectPing) {
         Write-Log "Falling back to direct HC pings" -Level WARN -Color Yellow
     }
 
-    foreach ($r in $results) {
+    # Stale wks/nb/non-standard results exist so a coordinator can weigh them
+    # against Atera's online state - there is no such judgment call without
+    # one, and pinging /fail directly here is the v2.2.4 flood (PR NB005,
+    # RAHR NB007, 2026-09-20): an offline notebook simply running out its own
+    # HC period. Filter them back out, exactly as the old pre-v2.6.0 `continue`
+    # did, so the fallback path behaves exactly as it always has.
+    $directResults = @($results | Where-Object { -not $_.IsStale })
+    $suppressedCount = $results.Count - $directResults.Count
+    if ($suppressedCount -gt 0) {
+        Write-Log "  Suppressing $suppressedCount stale result(s) from direct ping (no coordinator to judge online state; deferring to HC period)" -Level SKIP -Color DarkGray
+    }
+
+    foreach ($r in $directResults) {
         $pingResult = Send-HealthCheck -BaseUrl $config.healthchecksBaseUrl `
             -PingKey $pingKey `
             -Slug $r.Slug `

@@ -43,6 +43,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   process environment variable set immediately before launch and cleared immediately after. New
   config key `verifyAfterErrorCleanup` (default `true`) turns the whole feature off.
 
+### Fixed
+- **Stale-but-intact workstations/notebooks no longer generate false DOWN alerts when offline for
+  longer than their healthchecks.io period.** v2.2.4 (2026-07-03) made the monitor silently skip
+  reporting these machines to avoid flooding `/fail` pings — but that skip happened *before* the
+  coordinator ever saw them, so a notebook switched off for longer than its own HC period (8 days
+  for `nb*`, 4 for `wks*`) alerted DOWN purely on elapsed calendar time, even though it had missed
+  nothing (PR NB005 and RAHR NB007, 2026-09-20). These machines are now still added to the
+  coordinator report as unhealthy, so the coordinator's existing Atera online/offline + online-hours
+  logic — built for exactly this — can decide instead of the raw HC period. The v2.2.4 behaviour is
+  kept, unchanged, in the **direct-to-healthchecks.io fallback path only** (no coordinator configured
+  or reachable): there, stale workstation/notebook results are still filtered out before pinging, so
+  the original false-DOWN flood cannot come back when there's no coordinator to make the call.
+  Servers are unaffected — they still fail immediately as before.
+
 ## [2.5.1] - 2026-09-02
 
 ### Fixed
