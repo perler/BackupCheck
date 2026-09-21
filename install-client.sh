@@ -193,7 +193,7 @@ REMOTEEOF
 
   # Lock the staging folder to SYSTEM + Administrators BEFORE the password lands
   # in it: C:\ grants Users read and Authenticated Users modify by inheritance.
-  ssh "$SSH_USER@$TARGET_HOST" 'powershell -NoProfile -Command "New-Item -ItemType Directory -Path C:\BackupCheck-staging -Force | Out-Null; icacls C:\BackupCheck-staging /inheritance:r /grant:r *S-1-5-18:(OI)(CI)F *S-1-5-32-544:(OI)(CI)F /q | Out-Null"' >/dev/null
+  ssh "$SSH_USER@$TARGET_HOST" 'powershell -NoProfile -Command "New-Item -ItemType Directory -Path C:\BackupCheck-staging -Force | Out-Null; icacls C:\BackupCheck-staging /inheritance:r /grant:r '"'"'*S-1-5-18:(OI)(CI)F'"'"' '"'"'*S-1-5-32-544:(OI)(CI)F'"'"' /q | Out-Null; exit $LASTEXITCODE"' >/dev/null
   STAGING_CREATED=1
   scp -q "$TMPDIR/verify-password.json" "$TMPDIR/update-verify-password.ps1" \
       "$SSH_USER@$TARGET_HOST:C:/BackupCheck-staging/"
