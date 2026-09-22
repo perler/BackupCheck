@@ -5,6 +5,23 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.6.5] - 2026-09-22
+
+### Fixed
+- **A merge-rewritten base image no longer counts as a fresh backup.** Freshness was "any `.mrimg`
+  with a LastWriteTime inside `backupMaxAgeHours`". An incrementals-forever Macrium plan merges the
+  oldest incremental into the `<ImageID>-00-00.mrimg` base before every run, so the base's mtime
+  moves on every attempt, including attempts whose backup then fails. RAHR NB008 (newest real
+  backup 2026-06-17) and RAHR WKS001 (2026-08-26) both reported green on 2026-09-21 on nothing but
+  that rewritten base. Now only a new file counts: a new incremental/differential in the set, or a
+  set whose only members are its full (a new full chain). The base of a set that already has later
+  members is ignored. The same rule applies when deciding whether a newer backup has cleared a
+  failed Macrium verify, so a merge can no longer clear one either. Files that don't follow the
+  Macrium `<ImageID>-NN-NN.mrimg` naming keep the old mtime behaviour.
+- Expect machines whose backups had silently stopped to turn red, or (workstations/notebooks that
+  are offline in Atera) to go to the coordinator's `skipped_offline`/paused state, on the first run
+  of 2.6.5. Those are real findings, not regressions.
+
 ## [2.6.4] - 2026-09-21
 
 ### Fixed

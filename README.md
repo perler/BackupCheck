@@ -168,7 +168,9 @@ See [.env.example](.env.example) for all available fields.
 1. **Log rotation**: Cleans entries older than 7 days from `backupcheck.log`
 2. **Self-update check**: Fetches `latest.json` from GitHub (once per 24h), downloads and applies updates if available
 3. **Repository scanning**: For each repository, scans subdirectories (one per machine)
-4. **Health check**: For each machine, checks for recent `.mrimg` files within the configured threshold
+4. **Health check**: For each machine, checks for a new `.mrimg` file within the configured threshold.
+   The `-00-00` base of an image set that already has later members does not count: Macrium's
+   incremental merge rewrites it before every attempt, whether or not that backup then succeeds
 5. **HC ping**: Sends success/fail ping with version-tagged status message
 6. **HC configuration**: Auto-configures check period, grace, and tags (cached to reduce API calls)
 7. **Air-gap check**: Walks `airGapRepositories` (if configured) and pings `{companyId}-usb-copy`

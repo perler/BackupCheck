@@ -9,7 +9,8 @@ and works with any backup storage location.
 ## Key Design Decisions
 
 ### Filesystem-based monitoring
-- Checks for `.mrimg` files modified within the configured time window
+- Checks for `.mrimg` files modified within the configured time window, ignoring the merge-rewritten
+  `-00-00` base of an image set that already has later members (v2.6.5)
 - No dependency on Macrium Reflect API or license
 - Works with any network share or local path
 

@@ -33,9 +33,12 @@
     down to SYSTEM, BUILTIN\Administrators and the account the scheduled
     task runs as, since config.json can hold verifyPassword and .env holds
     NAS/coordinator credentials.
+    v2.6.5 fixes: a backup is fresh only if a NEW image file exists - the
+    base of an incremental chain, which Macrium's merge rewrites before
+    every attempt, no longer counts as a fresh backup.
 
 .NOTES
-    Version: 2.6.4
+    Version: 2.6.5
     Requires: PowerShell 5.1+
 #>
 
@@ -57,7 +60,7 @@ $ErrorActionPreference = "Stop"
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
 # Script version
-$script:Version = "2.6.4"
+$script:Version = "2.6.5"
 
 # A Macrium .mrimg that was written to completion carries this ASCII marker
 # inside its last 64 bytes; a truncated copy does not. Proven on RAHR's USB
@@ -471,6 +474,49 @@ function Get-CheckSlug {
     return "$CompanyId-$MachineName".ToLower()
 }
 
+function Remove-MergedBaseImage {
+    <#
+    .SYNOPSIS
+        Drops the base image of any Macrium image set that already has later
+        members, so its LastWriteTime cannot pass for a new backup.
+    .DESCRIPTION
+        Macrium names image files <ImageID>-<backup>-<file>.mrimg; backup 00
+        is the full that starts the set, 01, 02, ... are the incrementals or
+        differentials after it. An incrementals-forever plan merges the oldest
+        incremental into the -00-00 base before each run, rewriting the base
+        whether or not the backup that follows succeeds. Its mtime therefore
+        says "a merge ran", not "a backup was made": RAHR NB008 showed green
+        with "Last backup: 0.6h ago" on 2026-09-21 while its newest backup was
+        from 2026-06-17, and WKS001 likewise since 2026-08-26.
+
+        Only a NEW file proves a backup: a new incremental in the set, or a
+        new set whose only members are its full. A base is kept when its set
+        has no later member yet (a fresh full). Files that don't follow the
+        Macrium naming are passed through unchanged, so a custom naming
+        template keeps the pre-2.6.5 mtime behaviour.
+    #>
+    param(
+        [Parameter()]
+        [object[]]$Files
+    )
+
+    $all = @($Files | Where-Object { $_ })
+    if ($all.Count -eq 0) { return @() }
+
+    $pattern = '^([0-9A-Fa-f]{16})-(\d{2,})-\d{2,}\.mrimg$'
+    $setsWithLaterMembers = @{}
+    foreach ($f in $all) {
+        if ($f.Name -match $pattern -and [int]$Matches[2] -gt 0) {
+            $setsWithLaterMembers[$Matches[1].ToUpper()] = $true
+        }
+    }
+
+    return @($all | Where-Object {
+        -not ($_.Name -match $pattern -and [int]$Matches[2] -eq 0 -and
+              $setsWithLaterMembers.ContainsKey($Matches[1].ToUpper()))
+    })
+}
+
 function Test-BackupHealth {
     <#
     .SYNOPSIS
@@ -571,13 +617,15 @@ function Test-BackupHealth {
         $result.ErrorFileCount = ($errorFiles | Measure-Object).Count
     }
 
-    # Find backup files (exclude .error_loading and other non-backup extensions)
+    # Find backup files (exclude .error_loading and other non-backup extensions).
+    # The merged base of an incremental chain is dropped BEFORE the age cutoff
+    # (see Remove-MergedBaseImage): whether a base has later members is a fact
+    # about the whole chain, and those members are usually older than the cutoff.
     $cutoffTime = (Get-Date).AddHours(-$MaxAgeHours)
-    $backupFiles = Get-ChildItem -Path $Path -Filter $FilePattern -Recurse -File -ErrorAction SilentlyContinue |
-        Where-Object {
-            $_.LastWriteTime -gt $cutoffTime -and
-            $_.Name -notmatch '\.(error_loading\d*|tmp)$'
-        }
+    $allBackupFiles = @(Get-ChildItem -Path $Path -Filter $FilePattern -Recurse -File -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -notmatch '\.(error_loading\d*|tmp)$' })
+    $backupFiles = @(Remove-MergedBaseImage -Files $allBackupFiles |
+        Where-Object { $_.LastWriteTime -gt $cutoffTime })
 
     $result.BackupCount = ($backupFiles | Measure-Object).Count
 
@@ -795,9 +843,10 @@ function Get-NewestBackupTime {
         [string]$FilePattern
     )
 
-    $files = Get-ChildItem -Path $Path -Filter $FilePattern -Recurse -File -ErrorAction SilentlyContinue |
-        Where-Object { $_.Name -notmatch '\.(error_loading\d*|tmp)$' }
-    if (-not $files) { return $null }
+    $files = @(Get-ChildItem -Path $Path -Filter $FilePattern -Recurse -File -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -notmatch '\.(error_loading\d*|tmp)$' })
+    $files = @(Remove-MergedBaseImage -Files $files)
+    if ($files.Count -eq 0) { return $null }
     return ($files | Sort-Object LastWriteTime -Descending | Select-Object -First 1).LastWriteTime
 }
 
