@@ -2,7 +2,7 @@
 # Install BackupCheck on a Windows server, fully driven from this workstation.
 #
 # Usage: ./install-client.sh <CLIENT-CODE> <TARGET-HOST> [--ssh-user USER] [--task-user USER]
-#            [--repo <path>[=<machine>] ...] [--dry-run] [--update-verify-password]
+#            [--nas-user USER] [--repo <path>[=<machine>] ...] [--dry-run] [--update-verify-password]
 #   ./install-client.sh PR 192.168.101.12
 #   ./install-client.sh RAH 157.90.91.117 --repo 'D:\srv001=SRV001' --repo '\\nas003\backup=SRV001-offsite'
 #   ./install-client.sh STPH 10.0.4.20 --update-verify-password
@@ -11,7 +11,8 @@
 # Looks up via IT Portal:
 #   - AD\automat password (object Account, type AD, username automat) — fails if missing.
 #   - NAS share user/password (backup or backupadmin on the client's NAS device), only when
-#     at least one repository is a UNC path.
+#     at least one repository is a UNC path. Pass --nas-user USER to look up a different
+#     username explicitly (e.g. a client-specific service account).
 #   - Macrium image-set password(s): AdditionalCredentials of type Encryption hanging off the
 #     client's Macrium Configuration (type Backup, name matching /macrium|reflect/i). Optional —
 #     most clients don't encrypt their images, and config.json simply gets no verifyPassword.
@@ -39,6 +40,7 @@ TARGET_HOST="${2:-}"
 SSH_USER="admin"
 DRY_RUN=0
 TASK_USER_ARG=""
+NAS_USER_ARG=""
 REPO_SPECS=()
 UPDATE_VERIFY_PW_ONLY=0
 
@@ -47,6 +49,7 @@ while [[ $# -gt 2 ]]; do
     --ssh-user)                SSH_USER="$4"; shift 2 ;;
     --dry-run)                 DRY_RUN=1; shift ;;
     --task-user)                TASK_USER_ARG="$4"; shift 2 ;;
+    --nas-user)                 NAS_USER_ARG="$4"; shift 2 ;;
     --repo)                    REPO_SPECS+=("$4"); shift 2 ;;
     --update-verify-password)  UPDATE_VERIFY_PW_ONLY=1; shift ;;
     *)                          echo "Unknown flag: $3" >&2; exit 2 ;;
@@ -55,7 +58,7 @@ done
 
 if [[ -z "$CLIENT_CODE" || -z "$TARGET_HOST" ]]; then
   cat >&2 <<EOF
-Usage: $0 <CLIENT-CODE> <TARGET-HOST> [--ssh-user USER] [--task-user USER] [--repo <path>[=<machine>] ...] [--dry-run] [--update-verify-password]
+Usage: $0 <CLIENT-CODE> <TARGET-HOST> [--ssh-user USER] [--task-user USER] [--nas-user USER] [--repo <path>[=<machine>] ...] [--dry-run] [--update-verify-password]
 Example: $0 PR 192.168.101.12
 Example: $0 STPH 10.0.4.20 --update-verify-password
 EOF
@@ -489,11 +492,12 @@ if [[ -n "$NAS_HOSTNAME" ]]; then
 # The skill's `info <code>` shortcut is buggy (lowercase falls through to fuzzy
 # matches) — never use it for credential resolution.
 cyan "Looking up NAS credentials in IT Portal for \\\\${NAS_HOSTNAME}..."
-NAS_CREDS_JSON=$(cd "$ITPORTAL_DIR" && NAS_HOSTNAME="$NAS_HOSTNAME" CLIENT_CODE="$CLIENT_CODE" node -e "
+NAS_CREDS_JSON=$(cd "$ITPORTAL_DIR" && NAS_HOSTNAME="$NAS_HOSTNAME" CLIENT_CODE="$CLIENT_CODE" NAS_USER_ARG="$NAS_USER_ARG" node -e "
 const config = require('./config').load();
 const axios = require('axios');
 const code = process.env.CLIENT_CODE;
 const nasHost = process.env.NAS_HOSTNAME.toLowerCase();
+const nasUserArg = (process.env.NAS_USER_ARG || '').toLowerCase();
 const http = axios.create({ baseURL: config.baseURL, headers: { Authorization: config.apiKey } });
 (async () => {
   const cR = await http.get('/Companies/', { params: { abbreviation: code } });
@@ -531,11 +535,13 @@ const http = axios.create({ baseURL: config.baseURL, headers: { Authorization: c
   const mine = all.filter(c =>
     c.portalObject.itemType === 'Device' &&
     matchingDeviceIds.includes(c.portalObject.id) &&
-    ['backup', 'backupadmin'].includes((c.username || '').toLowerCase())
+    (nasUserArg
+      ? (c.username || '').toLowerCase() === nasUserArg
+      : ['backup', 'backupadmin'].includes((c.username || '').toLowerCase()))
   );
   if (mine.length === 0) { console.error('NO_CREDS_ON:' + nasHost); process.exit(3); }
-  // Prefer backupadmin
-  const pref = mine.find(c => (c.username || '').toLowerCase() === 'backupadmin') || mine[0];
+  // Prefer backupadmin — unless --nas-user named an exact username, which already picked it
+  const pref = nasUserArg ? mine[0] : (mine.find(c => (c.username || '').toLowerCase() === 'backupadmin') || mine[0]);
   process.stdout.write(JSON.stringify({
     user: pref.username, pass: pref.password,
     device: myDevices.get(pref.portalObject.id) || pref.portalObject.itemName
@@ -544,6 +550,9 @@ const http = axios.create({ baseURL: config.baseURL, headers: { Authorization: c
 " 2>&1) || {
   if [[ "$NAS_CREDS_JSON" == "NOT_FOUND" ]]; then
     fail "No NAS user 'backup' or 'backupadmin' found for $CLIENT_CODE in IT Portal."
+  fi
+  if [[ -n "$NAS_USER_ARG" && "$NAS_CREDS_JSON" == NO_CREDS_ON:* ]]; then
+    fail "No NAS user '$NAS_USER_ARG' found for $CLIENT_CODE in IT Portal."
   fi
   fail "NAS lookup failed: $NAS_CREDS_JSON"
 }
