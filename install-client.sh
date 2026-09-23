@@ -26,6 +26,11 @@
 # machine, no per-machine subdirectory is enumerated). A spec with no "=machine" behaves like
 # an auto-detected repository (each subdirectory enumerated as a machine).
 #
+# --task-user SYSTEM registers the task as NT AUTHORITY\SYSTEM with no password and skips the
+# IT Portal task-account lookup — for a workgroup PC whose repositories are all local paths
+# (SYSTEM has no credentials for a share). With it, a client code that has no IT Portal company
+# is accepted: config.json then simply gets no verifyPassword.
+#
 # --update-verify-password skips the whole install (no AD/task-account/repo/NAS discovery, no
 # scheduled task touched) and ONLY refreshes verifyPassword in the existing C:\BackupCheck\
 # config.json on TARGET-HOST from IT Portal, leaving every other key in the file alone. Use it
@@ -245,7 +250,13 @@ else
 fi
 
 # --- 4a. Task account credential lookup ---
-if [[ "$PART_OF_DOMAIN" == "True" ]]; then
+TASK_AS_SYSTEM=0
+[[ "${TASK_USER_ARG,,}" == "system" ]] && TASK_AS_SYSTEM=1
+if [[ "$TASK_AS_SYSTEM" == "1" ]]; then
+  green "  Task account: NT AUTHORITY\\SYSTEM (--task-user SYSTEM, no IT Portal lookup)"
+  TASK_USER="SYSTEM"
+  TASK_PASS=""
+elif [[ "$PART_OF_DOMAIN" == "True" ]]; then
 # AD\automat password lookup
 # IT Portal has a first-class "Object Account" concept (type "AD Accounts") that is
 # *separate* from AdditionalCredentials. The automat user is one of these. To fetch:
@@ -478,6 +489,7 @@ else
   NAS_SERVER_COUNT=$(echo "$NAS_SERVERS" | wc -l)
   [[ "$NAS_SERVER_COUNT" -eq 1 ]] || fail "Repositories span multiple NAS servers — this installer expects one: $NAS_SERVERS"
   NAS_HOSTNAME=$(echo "$NAS_SERVERS" | head -1)
+  [[ "$TASK_AS_SYSTEM" == "0" ]] || fail "--task-user SYSTEM cannot reach UNC repositories (SYSTEM has no share credentials): ${UNC_PATHS[*]}"
   green "  NAS server: \\\\${NAS_HOSTNAME}"
 fi
 
@@ -575,7 +587,10 @@ fi
 cyan "Looking up Macrium image-set password(s) in IT Portal for $CLIENT_CODE..."
 VERIFY_PW_RAW=$(fetch_verify_passwords_json) || {
   case "$VERIFY_PW_RAW" in
-    NOT_FOUND) fail "Client $CLIENT_CODE not found in IT Portal." ;;
+    NOT_FOUND)
+      [[ "$TASK_AS_SYSTEM" == "1" ]] || fail "Client $CLIENT_CODE not found in IT Portal."
+      cyan "  $CLIENT_CODE has no IT Portal company — continuing without verifyPassword (--task-user SYSTEM)"
+      VERIFY_PW_RAW="[]" ;;
     *)         fail "Macrium password lookup failed: $VERIFY_PW_RAW" ;;
   esac
 }
@@ -712,11 +727,19 @@ $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoi
 Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue |
     Unregister-ScheduledTask -Confirm:$false
 
-Register-ScheduledTask -TaskName $taskName `
-    -Action $action -Trigger $trigger -Settings $settings `
-    -User $args.TaskUser -Password $args.TaskPassword `
-    -Description "BackupCheck hourly Macrium repository scan" `
-    -RunLevel Highest | Out-Null
+if ($args.TaskUser -eq "SYSTEM") {
+    $principal = New-ScheduledTaskPrincipal -UserId "NT AUTHORITY\SYSTEM" -LogonType ServiceAccount -RunLevel Highest
+    Register-ScheduledTask -TaskName $taskName `
+        -Action $action -Trigger $trigger -Settings $settings -Principal $principal `
+        -Description "BackupCheck hourly Macrium repository scan" | Out-Null
+}
+else {
+    Register-ScheduledTask -TaskName $taskName `
+        -Action $action -Trigger $trigger -Settings $settings `
+        -User $args.TaskUser -Password $args.TaskPassword `
+        -Description "BackupCheck hourly Macrium repository scan" `
+        -RunLevel Highest | Out-Null
+}
 
 Write-Host "Scheduled task BackupMonitor registered as $($args.TaskUser)" -ForegroundColor Green
 
