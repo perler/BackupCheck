@@ -18,6 +18,8 @@
   "mrverifyPath": "",
   "verifyPassword": "",
   "healthchecksBaseUrl": "https://hc-ping.com",
+  "raidCheckUrl": "",
+  "storcliPath": "",
   "autoDetectRepositories": true,
   "tags": [],
   "channel": "stable"

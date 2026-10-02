@@ -36,9 +36,15 @@
     v2.6.5 fixes: a backup is fresh only if a NEW image file exists - the
     base of an incremental chain, which Macrium's merge rewrites before
     every attempt, no longer counts as a fresh backup.
+    v2.7.0 adds: a hardware-RAID check. Where a Broadcom/LSI MegaRAID
+    storcli is installed, every run reads the virtual and physical drive
+    states (read-only "show" commands) and pings its own check,
+    raidCheckUrl, /fail while any VD is not Optl or any PD is not Onln or a
+    hot spare (a rebuild included, with its progress). Independent of the
+    backup checks; skipped silently where storcli is absent.
 
 .NOTES
-    Version: 2.6.5
+    Version: 2.7.0
     Requires: PowerShell 5.1+
 #>
 
@@ -51,7 +57,13 @@ param(
     [string]$EnvPath,
 
     [Parameter()]
-    [switch]$SkipUpdateCheck
+    [switch]$SkipUpdateCheck,
+
+    # Run only the hardware-RAID check (v2.7.0) and exit: no update check, no
+    # backup scan, no backup/meta pings, .env not needed. Pings raidCheckUrl
+    # only if the config sets one - a config without it is a dry run.
+    [Parameter()]
+    [switch]$RaidCheckOnly
 )
 
 $ErrorActionPreference = "Stop"
@@ -60,7 +72,7 @@ $ErrorActionPreference = "Stop"
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
 # Script version
-$script:Version = "2.6.5"
+$script:Version = "2.7.0"
 
 # A Macrium .mrimg that was written to completion carries this ASCII marker
 # inside its last 64 bytes; a truncated copy does not. Proven on RAHR's USB
@@ -1744,6 +1756,222 @@ function Send-CoordinatorReport {
     }
 }
 
+function Find-StorCli {
+    <#
+    .SYNOPSIS
+        Locates the Broadcom/LSI MegaRAID command-line tool: a configured
+        path, then the install folders MegaRAID Storage Manager and the
+        stand-alone StorCLI package use, then PATH. Returns $null - never
+        throws - if none is found; the RAID check is then skipped silently,
+        since most monitored machines have no MegaRAID controller at all.
+    #>
+    param(
+        [Parameter()]
+        [string]$ConfiguredPath
+    )
+
+    if ($ConfiguredPath -and (Test-Path -LiteralPath $ConfiguredPath -PathType Leaf -ErrorAction SilentlyContinue)) {
+        return (Resolve-Path -LiteralPath $ConfiguredPath).Path
+    }
+
+    # STPH SRV002 (AVAGO MegaRAID 9361-4i) has it under MegaRAID Storage
+    # Manager in Program Files (x86), as of 2026-10-02.
+    $candidates = @(
+        'C:\Program Files (x86)\MegaRAID Storage Manager\StorCLI64.exe',
+        'C:\Program Files\MegaRAID Storage Manager\StorCLI64.exe',
+        'C:\Program Files\LSI\StorCLI\storcli64.exe',
+        'C:\Program Files\Broadcom\StorCLI\storcli64.exe',
+        'C:\StorCLI\storcli64.exe'
+    )
+    foreach ($candidate in $candidates) {
+        if (Test-Path -LiteralPath $candidate -PathType Leaf -ErrorAction SilentlyContinue) {
+            return (Resolve-Path -LiteralPath $candidate).Path
+        }
+    }
+
+    $onPath = Get-Command 'storcli64.exe' -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($onPath) { return $onPath.Source }
+
+    return $null
+}
+
+function Invoke-StorCliJson {
+    <#
+    .SYNOPSIS
+        Runs one READ-ONLY storcli "show" command with JSON output (J) and
+        returns its Controllers array. Throws if the output is not JSON.
+    #>
+    param(
+        [Parameter(Mandatory)]
+        [string]$StorCliPath,
+
+        [Parameter(Mandatory)]
+        [string[]]$Arguments
+    )
+
+    # Only "show" commands are ever passed in. stderr is deliberately not
+    # redirected: under $ErrorActionPreference = "Stop", PowerShell 5.1 turns
+    # a native stderr line merged with 2>&1 into a terminating error.
+    $raw = (& $StorCliPath @Arguments 'J') -join "`n"
+    $start = $raw.IndexOf('{')
+    if ($start -lt 0) { throw "storcli $($Arguments -join ' ') returned no JSON: $raw" }
+    return @((ConvertFrom-Json $raw.Substring($start)).Controllers)
+}
+
+function Test-RaidHealth {
+    <#
+    .SYNOPSIS
+        Asks every MegaRAID controller for its virtual and physical drives
+        and decides whether the arrays are healthy.
+    .DESCRIPTION
+        Healthy means every virtual drive is Optl and every physical drive is
+        Onln or a hot spare the controller has configured (GHS global, DHS
+        dedicated). Anything else - Dgrd, Pdgd, OfLn, Rbld, Offln, UBad,
+        UGood, Missing, a controller whose command did not succeed - is a
+        problem. A rebuild is a problem until it finishes and its progress
+        is put in the message.
+
+        Added after STPH SRV002 (2026-10-02): VD0 "Data" ran Degraded with
+        drive 252:0 rebuilding and nothing alerted anyone.
+
+        Never throws: a storcli failure becomes an unhealthy result whose
+        message says what went wrong, so the check goes red rather than
+        silent.
+    .OUTPUTS
+        @{ Healthy = [bool]; Problems = [string[]]; Summary = [string] }
+    #>
+    param(
+        [Parameter(Mandatory)]
+        [string]$StorCliPath
+    )
+
+    $okPdStates = @('Onln', 'GHS', 'DHS')
+    $problems = @()
+    $vdCount = 0
+    $pdCount = 0
+    $ctlCount = 0
+
+    try {
+        $vdControllers = Invoke-StorCliJson -StorCliPath $StorCliPath -Arguments @('/call/vall', 'show')
+        $pdControllers = Invoke-StorCliJson -StorCliPath $StorCliPath -Arguments @('/call/eall/sall', 'show')
+    }
+    catch {
+        return @{ Healthy = $false; Problems = @("storcli failed: $($_.Exception.Message)"); Summary = "storcli failed" }
+    }
+
+    foreach ($c in $vdControllers) {
+        $ctlCount++
+        $ctl = "c$($c.'Command Status'.Controller)"
+        if ($c.'Command Status'.Status -ne 'Success') {
+            # A controller with no virtual drives configured reports that as
+            # a failed "show" - not an array problem.
+            if ($c.'Command Status'.Description -notmatch 'No VD') {
+                $problems += "$ctl controller error: $($c.'Command Status'.Description)"
+            }
+            continue
+        }
+        foreach ($vd in @($c.'Response Data'.'Virtual Drives')) {
+            if (-not $vd) { continue }
+            $vdCount++
+            if ($vd.State -ne 'Optl') {
+                $problems += "$ctl VD $($vd.'DG/VD') `"$($vd.Name)`" $($vd.TYPE) $($vd.State)"
+            }
+        }
+    }
+
+    $rebuilding = @()
+    foreach ($c in $pdControllers) {
+        $ctl = "c$($c.'Command Status'.Controller)"
+        if ($c.'Command Status'.Status -ne 'Success') {
+            $problems += "$ctl drive query error: $($c.'Command Status'.Description)"
+            continue
+        }
+        foreach ($pd in @($c.'Response Data'.'Drive Information')) {
+            if (-not $pd) { continue }
+            $pdCount++
+            if ($okPdStates -contains $pd.State) { continue }
+            if ($pd.State -eq 'Rbld') {
+                $rebuilding += @{ Ctl = $ctl; Slot = $pd.'EID:Slt'; DG = $pd.DG }
+            }
+            else {
+                $problems += "$ctl PD $($pd.'EID:Slt') $($pd.State) (DG $($pd.DG), $($pd.Model))"
+            }
+        }
+    }
+
+    if ($rebuilding.Count -gt 0) {
+        # Progress only exists per drive, from a separate (still read-only) query.
+        $progress = @{}
+        try {
+            foreach ($c in (Invoke-StorCliJson -StorCliPath $StorCliPath -Arguments @('/call/eall/sall', 'show', 'rebuild'))) {
+                foreach ($r in @($c.'Response Data')) {
+                    if ($r.'Drive-ID' -match '^/c(\d+)/e(\d+)/s(\d+)$') {
+                        $progress["c$($Matches[1]) $($Matches[2]):$($Matches[3])"] = $r
+                    }
+                }
+            }
+        }
+        catch { }
+        foreach ($rb in $rebuilding) {
+            $r = $progress["$($rb.Ctl) $($rb.Slot)"]
+            $detail = if ($r) { "$($r.'Progress%')% rebuilt, $($r.'Estimated Time Left') left" } else { "progress unknown" }
+            $problems += "$($rb.Ctl) PD $($rb.Slot) Rbld (DG $($rb.DG), $detail)"
+        }
+    }
+
+    $summary = "$vdCount VD(s), $pdCount PD(s) on $ctlCount controller(s)"
+    return @{ Healthy = ($problems.Count -eq 0); Problems = $problems; Summary = $summary }
+}
+
+function Invoke-RaidCheck {
+    <#
+    .SYNOPSIS
+        Runs Test-RaidHealth when storcli is present, logs the verdict and
+        pings raidCheckUrl (success or /fail) if one is configured.
+    .DESCRIPTION
+        Independent of the backup checks: it never changes their counters,
+        their pings or the script's exit code, and never throws. No storcli
+        on the machine -> returns without logging or pinging. storcli present
+        but no raidCheckUrl -> the verdict is logged only.
+    #>
+    param(
+        [Parameter()]
+        [string]$ConfiguredStorCliPath,
+
+        [Parameter()]
+        [string]$RaidCheckUrl
+    )
+
+    try {
+        $storcli = Find-StorCli -ConfiguredPath $ConfiguredStorCliPath
+        if (-not $storcli) { return }
+
+        Write-Log "RAID check: $storcli" -Color Yellow
+        $raid = Test-RaidHealth -StorCliPath $storcli
+        if ($raid.Healthy) {
+            $raidMessage = "[BackupCheck v$($script:Version)] RAID OK: $($raid.Summary), all VDs Optl and all PDs Onln/hot spare"
+            Write-Log "  [OK]   $($raid.Summary)" -Level OK -Color Green
+        }
+        else {
+            $raidMessage = (@("[BackupCheck v$($script:Version)] RAID FAIL: $($raid.Summary), $($raid.Problems.Count) problem(s)") + $raid.Problems) -join "`n"
+            foreach ($p in $raid.Problems) { Write-Log "  [FAIL] $p" -Level FAIL -Color Red }
+        }
+
+        if (-not $RaidCheckUrl) {
+            Write-Log "  raidCheckUrl not set in config.json - RAID result not reported" -Level WARN -Color Yellow
+            return
+        }
+
+        $raidEndpoint = $RaidCheckUrl.TrimEnd('/')
+        if (-not $raid.Healthy) { $raidEndpoint += "/fail" }
+        Invoke-WebRequest -Uri $raidEndpoint -Method POST -Body $raidMessage -ContentType "text/plain" -UseBasicParsing | Out-Null
+        Write-Log "RAID ping sent ($(if ($raid.Healthy) { 'success' } else { 'FAIL' }))" -Level $(if ($raid.Healthy) { "OK" } else { "FAIL" }) -Color $(if ($raid.Healthy) { "Green" } else { "Red" })
+    }
+    catch {
+        Write-Log "RAID check failed: $_" -Level WARN -Color Yellow
+    }
+}
+
 #endregion
 
 #region Main
@@ -1773,6 +2001,16 @@ if (-not (Test-Path $ConfigPath)) {
 }
 
 $config = Get-Content $ConfigPath | ConvertFrom-Json
+
+# Hardware RAID (v2.7.0). Both keys optional: no storcli on the machine means
+# no check at all; no raidCheckUrl means the verdict is only logged.
+$storcliPath = if ($config.PSObject.Properties.Name -contains 'storcliPath') { [string]$config.storcliPath } else { $null }
+$raidCheckUrl = if ($config.PSObject.Properties.Name -contains 'raidCheckUrl') { [string]$config.raidCheckUrl } else { $null }
+
+if ($RaidCheckOnly) {
+    Invoke-RaidCheck -ConfiguredStorCliPath $storcliPath -RaidCheckUrl $raidCheckUrl
+    exit 0
+}
 
 # Load environment variables
 $envVars = Get-EnvFile -Path $EnvPath
@@ -2244,6 +2482,11 @@ if ($airGapRoots.Count -gt 0) {
         Save-ConfigCache -Cache $configCache
     }
 }
+
+# Phase 4: Hardware RAID -> its own check (raidCheckUrl). Separate from the
+# backup verdict on purpose: it never touches the counters, pings or exit
+# code above. Skipped silently where there is no MegaRAID storcli.
+Invoke-RaidCheck -ConfiguredStorCliPath $storcliPath -RaidCheckUrl $raidCheckUrl
 
 # Summary
 Write-Log ""

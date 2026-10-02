@@ -5,6 +5,22 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.7.0] - 2026-10-02
+
+### Added
+- **Hardware RAID check for Broadcom/LSI MegaRAID controllers.** On 2026-10-02 STPH SRV002's
+  MegaRAID 9361-4i ran VD0 "Data" Degraded, with drive 252:0 rebuilding, and nothing alerted anyone:
+  the monitor only looked at backup files. Where StorCLI is installed, every run now reads the VD and
+  PD states with read-only `show ... J` commands and pings a separate check, the new `raidCheckUrl`
+  config key: `/fail` while any VD is not `Optl` or any PD is not `Onln` or a controller-configured
+  hot spare (`GHS`/`DHS`), with one line per bad drive in the body; a rebuild counts as a failure
+  until it has finished and carries its progress and time estimate. StorCLI is found via the new
+  optional `storcliPath` key, then the MegaRAID Storage Manager and StorCLI install folders, then
+  `PATH`. No StorCLI means no check, silently; StorCLI without `raidCheckUrl` only logs the verdict.
+  The RAID result never changes the backup checks, their pings or the exit code.
+- **`-RaidCheckOnly` switch**: runs only the RAID check and exits, without update check, backup scan
+  or `.env`. With no `raidCheckUrl` in the config it is a dry run.
+
 ## [2.6.5] - 2026-09-22
 
 ### Fixed
