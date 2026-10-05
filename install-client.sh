@@ -8,6 +8,8 @@
 #   ./install-client.sh STPH 10.0.4.20 --update-verify-password
 #
 # Reads from BackupCheck/.env: HC_PING_KEY, HC_API_KEY, COORDINATOR_URL, COORDINATOR_API_KEY
+# (HC_* are the self-hosted Healthchecks `backups` project keys since 2026-10-05; config.json
+# points healthchecksBaseUrl/healthchecksApiUrl at https://healthchecks.patsplanet.com)
 # Looks up via IT Portal:
 #   - AD\automat password (object Account, type AD, username automat) — fails if missing.
 #   - NAS share user/password (backup or backupadmin on the client's NAS device), only when
@@ -647,7 +649,8 @@ config = {
   "backupFilePattern": "*.mrimg",
   "skipIfRunning": True,
   "runningFilePattern": "backup_running*",
-  "healthchecksBaseUrl": "https://hc-ping.com",
+  "healthchecksBaseUrl": "https://healthchecks.patsplanet.com/ping",
+  "healthchecksApiUrl": "https://healthchecks.patsplanet.com",
   "autoDetectRepositories": False,
   "tags": [],
   "channel": "stable"
