@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.8.0] - 2026-10-05
+
+### Added
+- **`healthchecksApiUrl` config key: the Management API base is no longer hardcoded.** Ping URLs
+  already came from `healthchecksBaseUrl`, but the call that sets tags, timeout and grace on a check
+  went to `https://healthchecks.io/api/v1/checks/` regardless, so a self-hosted Healthchecks could
+  be pinged but never configured. The key is the base only (`https://healthchecks.patsplanet.com`);
+  the script appends `/api/v1/checks/`. A missing or empty key means `https://healthchecks.io`, so
+  existing configs behave byte-for-byte as before.
+- Coordinator (`coordinator/app.py`) reads `HC_API_URL` and `HC_PING_URL` from its environment with
+  the same defaults (`https://healthchecks.io`, `https://hc-ping.com`); `pause-offline-checks.py`
+  reads `HC_API_URL` from its `.env`. Neither is redeployed by this release.
+
 ## [2.7.0] - 2026-10-02
 
 ### Added

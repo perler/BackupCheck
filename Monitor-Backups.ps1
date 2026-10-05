@@ -72,7 +72,7 @@ $ErrorActionPreference = "Stop"
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
 # Script version
-$script:Version = "2.7.0"
+$script:Version = "2.8.0"
 
 # A Macrium .mrimg that was written to completion carries this ASCII marker
 # inside its last 64 bytes; a truncated copy does not. Proven on RAHR's USB
@@ -1432,7 +1432,10 @@ function Send-HealthCheck {
         [string]$MachineName = "",
 
         [Parameter()]
-        [hashtable]$ConfigCache = @{}
+        [hashtable]$ConfigCache = @{},
+
+        [Parameter()]
+        [string]$ApiBaseUrl = "https://healthchecks.io"
     )
 
     $endpoint = if ($Success) {
@@ -1494,7 +1497,7 @@ function Send-HealthCheck {
             if ($needsUpdate) {
                 try {
                     $headers = @{ "X-Api-Key" = $ApiKey }
-                    $checks = Invoke-RestMethod -Uri "https://healthchecks.io/api/v1/checks/" -Headers $headers -Method Get
+                    $checks = Invoke-RestMethod -Uri "$($ApiBaseUrl.TrimEnd('/'))/api/v1/checks/" -Headers $headers -Method Get
                     $check = $checks.checks | Where-Object { $_.slug -eq $Slug }
                     if ($check -and $check.update_url) {
                         $updateData = @{ tags = $tagsString }
@@ -2133,6 +2136,10 @@ if ($config.airGapRepositories -and $config.airGapRepositories.Count -gt 0) {
 # Load HC API configuration cache
 $configCache = Get-ConfigCache
 
+# Healthchecks Management API base (v2.8.0). Optional; missing or empty means the
+# healthchecks.io cloud, exactly as before. Ping URLs come from healthchecksBaseUrl.
+$healthchecksApiUrl = if ($config.PSObject.Properties.Name -contains 'healthchecksApiUrl' -and $config.healthchecksApiUrl) { [string]$config.healthchecksApiUrl } else { "https://healthchecks.io" }
+
 # Connect to shares if credentials are provided
 $repoUsername = $envVars["REPO_USERNAME"]
 $repoPassword = $envVars["REPO_PASSWORD"]
@@ -2426,7 +2433,8 @@ if ($useDirectPing) {
             -Tags $tags `
             -ApiKey $apiKey `
             -MachineName $r.MachineName `
-            -ConfigCache $configCache
+            -ConfigCache $configCache `
+            -ApiBaseUrl $healthchecksApiUrl
 
         if (-not $pingResult.Success) {
             Write-Log "  Failed to send ping for $($r.MachineName): $($pingResult.Error)" -Level WARN -Color Yellow
@@ -2472,7 +2480,8 @@ if ($airGapRoots.Count -gt 0) {
             -Tags ($tags + "usbcopy") `
             -ApiKey $apiKey `
             -MachineName "usb-copy" `
-            -ConfigCache $configCache
+            -ConfigCache $configCache `
+            -ApiBaseUrl $healthchecksApiUrl
         if ($pingResult.Success) {
             Write-Log "Air-gap ping sent ($airGapSlug, $(if ($airGapSuccess) { 'success' } else { 'FAIL' }))" -Level $(if ($airGapSuccess) { "OK" } else { "FAIL" }) -Color $(if ($airGapSuccess) { "Green" } else { "Red" })
         }

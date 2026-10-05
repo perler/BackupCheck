@@ -139,10 +139,10 @@ def build_atera_lookup(agents, verbose=False):
     return lookup
 
 
-def fetch_hc_checks(api_key, verbose=False):
+def fetch_hc_checks(api_key, verbose=False, api_url="https://healthchecks.io"):
     """Fetch all checks from healthchecks.io Management API."""
     headers = {"X-Api-Key": api_key}
-    url = "https://healthchecks.io/api/v1/checks/"
+    url = api_url.rstrip("/") + "/api/v1/checks/"
     if verbose:
         print("  Fetching healthchecks.io checks...")
     data = api_request(url, headers)
@@ -273,7 +273,7 @@ def main():
         sys.exit(1)
 
     try:
-        checks = fetch_hc_checks(hc_api_key, verbose=args.verbose)
+        checks = fetch_hc_checks(hc_api_key, verbose=args.verbose, api_url=env.get("HC_API_URL") or "https://healthchecks.io")
         print(f"Healthchecks: {len(checks)} checks fetched")
     except Exception as e:
         print(f"ERROR: Failed to fetch healthchecks.io checks: {e}")

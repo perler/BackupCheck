@@ -11,6 +11,8 @@ services:
     environment:
       - HC_API_KEY=${HC_API_KEY}
       - HC_PING_KEY=${HC_PING_KEY}
+      - HC_API_URL=${HC_API_URL:-https://healthchecks.io}
+      - HC_PING_URL=${HC_PING_URL:-https://hc-ping.com}
       - ATERA_API_KEY=${ATERA_API_KEY}
       - COORDINATOR_API_KEYS=${COORDINATOR_API_KEYS}
       - COORDINATOR_ADMIN_KEY=${COORDINATOR_ADMIN_KEY}

@@ -18,6 +18,7 @@
   "mrverifyPath": "",
   "verifyPassword": "",
   "healthchecksBaseUrl": "https://hc-ping.com",
+  "healthchecksApiUrl": "https://healthchecks.io",
   "raidCheckUrl": "",
   "storcliPath": "",
   "autoDetectRepositories": true,

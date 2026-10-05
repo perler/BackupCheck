@@ -38,6 +38,9 @@ DB_PATH = os.environ.get("COORDINATOR_DB", "/data/coordinator.db")
 RELEASES_DIR = Path(os.environ.get("COORDINATOR_RELEASES", "/releases"))
 HC_API_KEY = os.environ.get("HC_API_KEY", "")
 HC_PING_KEY = os.environ.get("HC_PING_KEY", "")
+# Healthchecks endpoints; defaults are the healthchecks.io cloud (unchanged behaviour).
+HC_API_URL = (os.environ.get("HC_API_URL") or "https://healthchecks.io").rstrip("/")
+HC_PING_URL = (os.environ.get("HC_PING_URL") or "https://hc-ping.com").rstrip("/")
 ATERA_API_KEY = os.environ.get("ATERA_API_KEY", "")
 API_KEYS = [k.strip() for k in os.environ.get("COORDINATOR_API_KEYS", "").split(",") if k.strip()]
 ADMIN_KEY = os.environ.get("COORDINATOR_ADMIN_KEY", "")
@@ -325,7 +328,7 @@ def ping_hc(slug, success, message=""):
 
     suffix = "" if success else "/fail"
     encoded_slug = urllib.parse.quote(slug, safe="-")
-    url = f"https://hc-ping.com/{HC_PING_KEY}/{encoded_slug}{suffix}?create=1"
+    url = f"{HC_PING_URL}/{HC_PING_KEY}/{encoded_slug}{suffix}?create=1"
 
     try:
         data = message.encode("utf-8") if message else None
@@ -370,7 +373,7 @@ def get_hc_uuid(db, slug):
         return row["uuid"]
 
     encoded = urllib.parse.quote(slug, safe="-")
-    url = f"https://healthchecks.io/api/v3/checks/?slug={encoded}"
+    url = f"{HC_API_URL}/api/v3/checks/?slug={encoded}"
     try:
         data = _hc_api_request(url)
     except Exception as e:
@@ -400,7 +403,7 @@ def pause_hc(db, slug):
     uuid = get_hc_uuid(db, slug)
     if not uuid:
         return False
-    url = f"https://healthchecks.io/api/v3/checks/{uuid}/pause"
+    url = f"{HC_API_URL}/api/v3/checks/{uuid}/pause"
     try:
         _hc_api_request(url, method="POST")
         return True
@@ -449,7 +452,7 @@ def ensure_hc_config(db, slug, company_id, name):
 
     try:
         _hc_api_request(
-            f"https://healthchecks.io/api/v3/checks/{uuid}", method="POST", data=desired
+            f"{HC_API_URL}/api/v3/checks/{uuid}", method="POST", data=desired
         )
     except Exception as e:
         log.error(f"HC config update failed for {slug}: {e}")
